@@ -1,0 +1,18 @@
+[package]
+name = "agent-wasm"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+agent = { path = "../agent" }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+lean = { workspace = true, features = ["web"] }
+wasm-bindgen = { workspace = true }
+js-sys = { workspace = true }
+web-sys = { workspace = true }
+console_error_panic_hook = { workspace = true }
+tokenizers = { workspace = true, features = ["unstable_wasm", "fancy-regex"] }
