@@ -1,0 +1,41 @@
+[workspace]
+members = [
+    "crates/agent",
+    "crates/agent-wasm",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+minijinja = { version = "2", features = ["json", "preserve_order"] }
+minijinja-contrib = { version = "2.24.0", features = ["pycompat"] }
+tokenizers = { version = "0.22", default-features = false }
+clap = { version = "4.5", features = ["derive", "env"] }
+
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console"] }
+console_error_panic_hook = "0.1"
+getrandom = { version = "0.3", default-features = false }
+
+# Pinned to an exact commit of origin/main so a clean clone always resolves
+# the same lean API, with no path dependency anywhere in this workspace.
+# Default features (native-bin) pull in the pollster/clap lean's own
+# native Engine::new()/CLI need; agent-wasm overrides to default-features
+# = false, features = ["web"] for the wasm32 build.
+lean = { git = "https://github.com/idle-intelligence/llm-web", rev = "b321c16117cc2aef425c6471cbcb4cd7257fe518" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[profile.release-wasm]
+inherits = "release"
+opt-level = "s"

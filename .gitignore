@@ -1,0 +1,8 @@
+/target
+/_site
+/models
+*.gguf
+.DS_Store
+**/pkg/
+**/pkg-mt/
+crates/agent/reference/.venv
