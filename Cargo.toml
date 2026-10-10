@@ -13,23 +13,22 @@ edition = "2021"
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
-minijinja = { version = "2", features = ["json", "preserve_order"] }
-minijinja-contrib = { version = "2.24.0", features = ["pycompat"] }
 tokenizers = { version = "0.22", default-features = false }
 clap = { version = "4.5", features = ["derive", "env"] }
+pollster = "0.3"
 
 wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["console"] }
 console_error_panic_hook = "0.1"
-getrandom = { version = "0.3", default-features = false }
 
-# Pinned to an exact commit of origin/main so a clean clone always resolves
-# the same lean API, with no path dependency anywhere in this workspace.
-# Default features (native-bin) pull in the pollster/clap lean's own
-# native Engine::new()/CLI need; agent-wasm overrides to default-features
-# = false, features = ["web"] for the wasm32 build.
-lean = { git = "https://github.com/idle-intelligence/llm-web", rev = "b321c16117cc2aef425c6471cbcb4cd7257fe518" }
+# lean's engine (text in, text out) and its chat layer (messages and tools
+# to prompt text with the model's own template), pinned to one commit of
+# llm-web so a clean clone always resolves the same API. No default
+# features: the agent crate turns on `threads` natively and agent-wasm
+# turns on `web`.
+lean = { git = "https://github.com/idle-intelligence/llm-web", rev = "1fce23d866c23fb6f3635abb51db52c50ff87808", default-features = false }
+lean-chat = { git = "https://github.com/idle-intelligence/llm-web", rev = "1fce23d866c23fb6f3635abb51db52c50ff87808" }
 
 [profile.release]
 lto = true

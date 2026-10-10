@@ -3,21 +3,38 @@ name = "agent"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["lean"]
+# `LeanGenerator`: the agent's `Generator` on lean's engine.
+lean = ["dep:lean"]
+
 [dependencies]
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-minijinja = { workspace = true }
-minijinja-contrib = { workspace = true }
-lean = { workspace = true }
+lean-chat = { workspace = true }
+lean = { workspace = true, optional = true }
 
+# Natively, lean's CPU forward pass can use every core when no GPU adapter
+# is available.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokenizers = { workspace = true, features = ["fancy-regex"] }
-pollster = "0.3"
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-tokenizers = { workspace = true, features = ["unstable_wasm", "fancy-regex"] }
+lean = { workspace = true, optional = true, features = ["threads"] }
 
 [dev-dependencies]
-serde = { workspace = true }
 clap = { workspace = true }
+pollster = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokenizers = { workspace = true, features = ["fancy-regex"] }
+
+[[example]]
+name = "agent_cli"
+required-features = ["lean"]
+
+[[example]]
+name = "agent_eval"
+required-features = ["lean"]
+
+[[test]]
+name = "agent_live"
+required-features = ["lean"]

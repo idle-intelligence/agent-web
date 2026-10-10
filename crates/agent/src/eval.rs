@@ -319,7 +319,7 @@ pub fn score(
     }
 }
 
-pub fn run_case<G: Generator>(
+pub async fn run_case<G: Generator>(
     agent: &mut Agent<G, FixtureCaller>,
     tools: &[Tool],
     case: &EvalCase,
@@ -336,7 +336,7 @@ pub fn run_case<G: Generator>(
         tool_errors += step.tool_errors;
     };
 
-    let mut outcome = agent.start(&case.utterance, tools);
+    let mut outcome = agent.start(&case.utterance, tools).await;
     let (correct, reason) = loop {
         steps += 1;
         match outcome {
@@ -361,8 +361,15 @@ pub fn run_case<G: Generator>(
                     let calls_made = to_tool_calls(&caller.calls_seen);
                     break score(case, &calls_made, households.as_ref(), false);
                 }
-                outcome = agent.provide_tool_results(results);
+                outcome = agent.provide_tool_results(results).await;
             }
+            StepOutcome::ContextOverflow { needed, available } => {
+                break (
+                    false,
+                    format!("context overflow: needed {needed} tokens, {available} available"),
+                );
+            }
+            StepOutcome::Aborted => break (false, "aborted".to_string()),
             StepOutcome::Error { message, step } => {
                 if let Some(step) = step {
                     accumulate(&step);
@@ -428,7 +435,7 @@ pub struct EvalReport {
     pub max_steps: usize,
 }
 
-pub fn run_all<G: Generator>(
+pub async fn run_all<G: Generator>(
     agent: &mut Agent<G, FixtureCaller>,
     tools: &[Tool],
     cases: &[EvalCase],
@@ -445,7 +452,7 @@ pub fn run_all<G: Generator>(
             continue;
         }
         let mut caller = FixtureCaller::new(results_dir);
-        results.push(run_case(agent, tools, case, &mut caller));
+        results.push(run_case(agent, tools, case, &mut caller).await);
     }
 
     let scored: Vec<&CaseResult> = results.iter().filter(|r| !r.skipped).collect();

@@ -1,102 +1,24 @@
-//! Tool-calling chat template, output parser and step-wise agent loop for
-//! Qwen2.5-Instruct's own tools format: `<tools>...</tools>` in the system
-//! turn, `<tool_call>{"name":..., "arguments":...}</tool_call>` in the
+//! Tool-calling agent loop for Qwen2.5-Instruct's own tools format:
+//! `<tools>...</tools>` in the system turn (rendered by the model's chat
+//! template), `<tool_call>{"name":..., "arguments":...}</tool_call>` in the
 //! model's output.
 //!
-//! This module has no dependency on any particular inference engine: the
-//! loop is driven by the [`Generator`] trait, implemented against lean's
-//! public CPU and GPU APIs in `crate::backend`.
+//! Prompts are rendered with lean-chat (the model's own chat template, byte
+//! for byte what transformers' `apply_chat_template` renders). The loop has
+//! no dependency on any inference engine: it is driven by the
+//! [`Generator`] trait, prompt text in and reply text out.
 
 use anyhow::{bail, Context, Result};
-use minijinja::value::{Kwargs, Value as MjValue};
-use minijinja::{context, Environment};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io;
 
+pub use crate::generator::{AbortFlag, GenerateError, Generator};
+pub use lean_chat::{ChatTemplate, Message};
+
 // ---------------------------------------------------------------------
-// Message / tool-call wire types
+// Tool definitions
 // ---------------------------------------------------------------------
-
-/// A single chat message, matching the fields Qwen2.5-Instruct's tools
-/// template inspects (`role`, `content`, `tool_calls`, `name`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Message {
-    pub role: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ToolCallEntry>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-}
-
-impl Message {
-    pub fn system(content: impl Into<String>) -> Self {
-        Self {
-            role: "system".into(),
-            content: Some(Value::String(content.into())),
-            tool_calls: None,
-            name: None,
-        }
-    }
-
-    pub fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: "user".into(),
-            content: Some(Value::String(content.into())),
-            tool_calls: None,
-            name: None,
-        }
-    }
-
-    pub fn assistant_text(content: impl Into<String>) -> Self {
-        Self {
-            role: "assistant".into(),
-            content: Some(Value::String(content.into())),
-            tool_calls: None,
-            name: None,
-        }
-    }
-
-    pub fn assistant_tool_calls(tool_calls: Vec<ToolCallEntry>) -> Self {
-        Self {
-            role: "assistant".into(),
-            content: None,
-            tool_calls: Some(tool_calls),
-            name: None,
-        }
-    }
-
-    /// A `tool`-role message carrying one call's result (Qwen2.5's
-    /// template wraps every `tool`-role message's content in
-    /// `<tool_response>...</tool_response>`).
-    pub fn tool_result(name: impl Into<String>, content: impl Into<String>) -> Self {
-        Self {
-            role: "tool".into(),
-            content: Some(Value::String(content.into())),
-            tool_calls: None,
-            name: Some(name.into()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ToolCallEntry {
-    #[serde(rename = "type", default = "default_function_kind")]
-    pub kind: String,
-    pub function: ToolCallFunction,
-}
-
-fn default_function_kind() -> String {
-    "function".to_string()
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ToolCallFunction {
-    pub name: String,
-    pub arguments: Value,
-}
 
 /// One entry of the `tools` list, transformers/OpenAI shape:
 /// `{"type": "function", "function": {"name", "description", "parameters"}}`.
@@ -105,6 +27,10 @@ pub struct Tool {
     #[serde(rename = "type", default = "default_function_kind")]
     pub kind: String,
     pub function: ToolFunction,
+}
+
+fn default_function_kind() -> String {
+    "function".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -134,9 +60,9 @@ impl Tool {
 }
 
 // ---------------------------------------------------------------------
-// py_tojson: byte-exact `tojson` against Python's `json.dumps` (minijinja's
-// built-in `tojson` HTML-escapes and uses different compact-mode separator
-// spacing, which breaks parity against `transformers.apply_chat_template`).
+// Python `json.dumps` formatting for tool results (the same separators
+// the chat template's `tojson` uses for tool calls), so a tool result
+// reads like the rest of the prompt.
 // ---------------------------------------------------------------------
 
 #[derive(Default)]
@@ -173,79 +99,29 @@ pub(crate) fn to_json_compact_py<T: ?Sized + Serialize>(value: &T) -> Result<Str
     Ok(String::from_utf8(out).expect("serde_json only emits valid UTF-8"))
 }
 
-fn json_error(err: impl std::fmt::Display) -> minijinja::Error {
-    minijinja::Error::new(
-        minijinja::ErrorKind::InvalidOperation,
-        format!("cannot serialize to JSON: {err}"),
-    )
-}
+// ---------------------------------------------------------------------
+// Prompt rendering
+// ---------------------------------------------------------------------
 
-fn py_tojson(value: MjValue, kwargs: Kwargs) -> std::result::Result<MjValue, minijinja::Error> {
-    let indent: Option<usize> = kwargs.get("indent").ok();
-    kwargs.assert_all_used()?;
-
-    let rendered = match indent {
-        Some(indent) => {
-            let mut out = Vec::new();
-            let indentation = " ".repeat(indent);
-            let formatter = serde_json::ser::PrettyFormatter::with_indent(indentation.as_bytes());
-            let mut ser = serde_json::Serializer::with_formatter(&mut out, formatter);
-            serde::Serialize::serialize(&value, &mut ser).map_err(json_error)?;
-            String::from_utf8(out).expect("serde_json only emits valid UTF-8")
-        }
-        None => to_json_compact_py(&value).map_err(json_error)?,
+/// The prompt for the next model turn: `messages` and `tools` through the
+/// model's chat template (lean-chat, byte-exact with transformers'
+/// `apply_chat_template(messages, tools=tools, add_generation_prompt=True)`).
+/// No tools renders like `tools=None`, which skips the tools preamble.
+pub fn render_prompt(
+    template: &ChatTemplate,
+    messages: &[Message],
+    tools: &[Tool],
+) -> Result<String> {
+    let tools: Vec<Value> = tools
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<_, _>>()?;
+    let tools = if tools.is_empty() {
+        None
+    } else {
+        Some(tools.as_slice())
     };
-
-    Ok(MjValue::from_safe_string(rendered))
-}
-
-// ---------------------------------------------------------------------
-// Template: Qwen2.5-Instruct's own `chat_template`, tools-enabled.
-// ---------------------------------------------------------------------
-
-pub struct AgentChatTemplate {
-    env: Environment<'static>,
-}
-
-impl AgentChatTemplate {
-    pub fn new(template_source: impl Into<String>) -> Result<Self> {
-        let mut env = Environment::new();
-        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        env.add_filter("tojson", py_tojson);
-        env.add_template_owned("chat", template_source.into())
-            .context("failed to compile chat_template")?;
-        Ok(Self { env })
-    }
-
-    pub fn from_tokenizer_config_json(tokenizer_config_json: &str) -> Result<Self> {
-        let value: Value = serde_json::from_str(tokenizer_config_json)?;
-        let template_source = value
-            .get("chat_template")
-            .and_then(Value::as_str)
-            .context("tokenizer_config.json has no string 'chat_template' field")?;
-        Self::new(template_source)
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn from_tokenizer_config_path(path: &str) -> Result<Self> {
-        let text = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
-        Self::from_tokenizer_config_json(&text)
-    }
-
-    /// `tools` renders as Jinja `none` when empty, matching
-    /// `transformers.apply_chat_template([...], tools=[])`'s behavior of
-    /// skipping the tool preamble.
-    pub fn render(
-        &self,
-        messages: &[Message],
-        tools: &[Tool],
-        add_generation_prompt: bool,
-    ) -> Result<String> {
-        let tmpl = self.env.get_template("chat").unwrap();
-        let tools_ctx = if tools.is_empty() { None } else { Some(tools) };
-        let rendered = tmpl.render(context! { messages => messages, tools => tools_ctx, add_generation_prompt => add_generation_prompt })?;
-        Ok(rendered)
-    }
+    lean_chat::render(template, messages, tools, true)
 }
 
 // ---------------------------------------------------------------------
@@ -345,7 +221,16 @@ pub fn format_tool_result(name: &str, result: &Value) -> Message {
     if content.len() > MAX_RESULT_CHARS {
         eprintln!("warning: tool result for {name} is {} chars, over MAX_RESULT_CHARS ({MAX_RESULT_CHARS}); keeping it uncut", content.len());
     }
-    Message::tool_result(name, content)
+    tool_message(name, content)
+}
+
+/// A `tool`-role message carrying one call's result (Qwen2.5's template
+/// wraps its content in `<tool_response>...</tool_response>`).
+fn tool_message(name: &str, content: String) -> Message {
+    Message {
+        name: Some(name.to_string()),
+        ..Message::tool(content)
+    }
 }
 
 /// If `result` is an MCP-shaped error (`isError: true` or a top-level
@@ -382,7 +267,7 @@ pub fn tool_error_message(result: &Value) -> Option<String> {
 pub fn format_tool_error(name: &str, message: &str) -> Message {
     let content = to_json_compact_py(&serde_json::json!({ "error": message }))
         .unwrap_or_else(|_| format!("{{\"error\": {message:?}}}"));
-    Message::tool_result(name, content)
+    tool_message(name, content)
 }
 
 // ---------------------------------------------------------------------
@@ -402,37 +287,42 @@ pub trait ToolCaller {
     fn call(&mut self, name: &str, args: &Value) -> Result<Value>;
 }
 
-/// Runs the model forward from `prompt_ids`, sampling up to
-/// `max_new_tokens` tokens (fewer if an eos id is hit). Greedy only.
-///
-/// Implementations live in `crate::backend`, built on lean's public CPU
-/// and GPU forward-pass APIs; this trait itself has no engine dependency.
-pub trait Generator {
-    fn generate(&mut self, prompt_ids: &[u32], max_new_tokens: usize) -> Result<Vec<u32>>;
-}
-
-/// A `Generator` that replays a scripted sequence of outputs for tests.
+/// A `Generator` that replays a scripted sequence of replies for tests.
 pub struct FixtureGenerator {
-    script: Vec<Vec<u32>>,
+    script: Vec<String>,
     next: usize,
 }
 
 impl FixtureGenerator {
-    pub fn new(script: Vec<Vec<u32>>) -> Self {
+    pub fn new(script: Vec<String>) -> Self {
         Self { script, next: 0 }
     }
 }
 
 impl Generator for FixtureGenerator {
-    fn generate(&mut self, _prompt_ids: &[u32], _max_new_tokens: usize) -> Result<Vec<u32>> {
-        let out = self.script.get(self.next).cloned().ok_or_else(|| {
-            anyhow::anyhow!(
-                "FixtureGenerator script exhausted after {} call(s)",
-                self.next
-            )
-        })?;
-        self.next += 1;
-        Ok(out)
+    fn generate(
+        &mut self,
+        _prompt: &str,
+        _max_new_tokens: usize,
+        on_text: &mut dyn FnMut(&str),
+        abort: &AbortFlag,
+    ) -> impl std::future::Future<Output = std::result::Result<String, GenerateError>> {
+        let reply = if abort.is_aborted() {
+            Err(GenerateError::Aborted)
+        } else {
+            match self.script.get(self.next) {
+                Some(text) => {
+                    self.next += 1;
+                    on_text(text);
+                    Ok(text.clone())
+                }
+                None => Err(GenerateError::Other(anyhow::anyhow!(
+                    "FixtureGenerator script exhausted after {} call(s)",
+                    self.next
+                ))),
+            }
+        };
+        std::future::ready(reply)
     }
 }
 
@@ -474,7 +364,7 @@ pub struct PendingToolCall {
 /// One render -> generate -> parse round of the agent loop.
 #[derive(Debug)]
 pub struct Step {
-    pub prompt_tokens: Vec<u32>,
+    pub prompt: String,
     pub generated_text: String,
     pub parsed: ParsedOutput,
     pub retries: usize,
@@ -498,6 +388,15 @@ pub enum StepOutcome {
         text: String,
         step: Step,
     },
+    /// The prompt no longer fits the engine's context (`needed` tokens,
+    /// `available` in the context). What to drop is the caller's choice,
+    /// e.g. fewer tools or a shorter system prompt.
+    ContextOverflow {
+        needed: usize,
+        available: usize,
+    },
+    /// The turn was stopped through [`Agent::abort_flag`].
+    Aborted,
     Error {
         message: String,
         step: Option<Step>,
@@ -505,20 +404,21 @@ pub enum StepOutcome {
 }
 
 struct AttemptOutput {
-    prompt_tokens: Vec<u32>,
+    prompt: String,
     generated_text: String,
     parsed: std::result::Result<ParsedOutput, String>,
 }
 
 pub struct Agent<G: Generator, C: ToolCaller> {
-    template: AgentChatTemplate,
-    tokenizer: tokenizers::Tokenizer,
+    template: ChatTemplate,
     generator: G,
     caller: C,
     system_prompt: String,
     max_new_tokens: usize,
     max_steps: usize,
     max_retries: usize,
+    abort: AbortFlag,
+    on_text: Box<dyn FnMut(&str)>,
 
     messages: Vec<Message>,
     tools: Vec<Tool>,
@@ -530,8 +430,7 @@ pub struct Agent<G: Generator, C: ToolCaller> {
 
 impl<G: Generator, C: ToolCaller> Agent<G, C> {
     pub fn new(
-        template: AgentChatTemplate,
-        tokenizer: tokenizers::Tokenizer,
+        template: ChatTemplate,
         generator: G,
         caller: C,
         system_prompt: impl Into<String>,
@@ -539,13 +438,14 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
     ) -> Self {
         Self {
             template,
-            tokenizer,
             generator,
             caller,
             system_prompt: system_prompt.into(),
             max_new_tokens,
             max_steps: DEFAULT_MAX_STEPS,
             max_retries: DEFAULT_MAX_RETRIES,
+            abort: AbortFlag::new(),
+            on_text: Box::new(|_| {}),
             messages: Vec::new(),
             tools: Vec::new(),
             step_index: 0,
@@ -559,12 +459,28 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         &self.caller
     }
 
+    pub fn generator(&self) -> &G {
+        &self.generator
+    }
+
     pub fn set_max_steps(&mut self, max_steps: usize) {
         self.max_steps = max_steps;
     }
 
     pub fn set_max_retries(&mut self, max_retries: usize) {
         self.max_retries = max_retries;
+    }
+
+    /// Receives the model's raw output as it is generated, every step
+    /// (tool calls included, before they are parsed).
+    pub fn set_on_text(&mut self, on_text: impl FnMut(&str) + 'static) {
+        self.on_text = Box::new(on_text);
+    }
+
+    /// A handle that stops the current turn: after `abort()`, the running
+    /// step returns [`StepOutcome::Aborted`]. [`Agent::start`] clears it.
+    pub fn abort_flag(&self) -> AbortFlag {
+        self.abort.clone()
     }
 
     pub fn reset(&mut self) {
@@ -576,7 +492,8 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         self.calls_made_this_turn.clear();
     }
 
-    pub fn start(&mut self, utterance: &str, tools: &[Tool]) -> StepOutcome {
+    pub async fn start(&mut self, utterance: &str, tools: &[Tool]) -> StepOutcome {
+        self.abort.reset();
         self.tools = tools.to_vec();
         self.messages = vec![
             Message::system(&self.system_prompt),
@@ -587,10 +504,10 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         self.consecutive_tool_errors = 0;
         self.calls_made_this_turn.clear();
 
-        self.step_inner()
+        self.step_inner().await
     }
 
-    pub fn start_from_mcp(&mut self, utterance: &str, raw_tools: &[Value]) -> StepOutcome {
+    pub async fn start_from_mcp(&mut self, utterance: &str, raw_tools: &[Value]) -> StepOutcome {
         let tools: Vec<Tool> = raw_tools
             .iter()
             .filter_map(|t| {
@@ -601,12 +518,12 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                 ))
             })
             .collect();
-        self.start(utterance, &tools)
+        self.start(utterance, &tools).await
     }
 
     /// Continue the current turn with the results of the tool calls from
     /// the most recent `NeedTools` outcome, keyed by `call_id`.
-    pub fn provide_tool_results(&mut self, results: Vec<(String, Value)>) -> StepOutcome {
+    pub async fn provide_tool_results(&mut self, results: Vec<(String, Value)>) -> StepOutcome {
         for (call_id, result) in results {
             if let Some(pending) = self.pending_calls.iter().find(|c| c.call_id == call_id) {
                 if let Some(error_message) = tool_error_message(&result) {
@@ -631,30 +548,43 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             }
         }
         self.pending_calls.clear();
-        self.step_inner()
+        self.step_inner().await
     }
 
-    fn generate_attempt(&mut self) -> std::result::Result<AttemptOutput, String> {
-        let rendered = self
-            .template
-            .render(&self.messages, &self.tools, true)
-            .map_err(|e| format!("rendering prompt: {e:#}"))?;
-        let encoding = self
-            .tokenizer
-            .encode(rendered, false)
-            .map_err(|e| format!("tokenizer encode failed: {e}"))?;
-        let prompt_tokens = encoding.get_ids().to_vec();
-        let out_ids = self
-            .generator
-            .generate(&prompt_tokens, self.max_new_tokens)
-            .map_err(|e| format!("generation failed: {e:#}"))?;
+    /// Renders the conversation, generates and parses one reply. `Err` is
+    /// the outcome to return as is (render or engine failure, overflow,
+    /// abort).
+    async fn generate_attempt(&mut self) -> std::result::Result<AttemptOutput, Box<StepOutcome>> {
+        let prompt = render_prompt(&self.template, &self.messages, &self.tools).map_err(|e| {
+            StepOutcome::Error {
+                message: format!("rendering prompt: {e:#}"),
+                step: None,
+            }
+        })?;
         let generated_text = self
-            .tokenizer
-            .decode(&out_ids, true)
-            .map_err(|e| format!("tokenizer decode failed: {e}"))?;
+            .generator
+            .generate(
+                &prompt,
+                self.max_new_tokens,
+                &mut *self.on_text,
+                &self.abort,
+            )
+            .await
+            .map_err(|e| {
+                Box::new(match e {
+                    GenerateError::ContextOverflow { needed, available } => {
+                        StepOutcome::ContextOverflow { needed, available }
+                    }
+                    GenerateError::Aborted => StepOutcome::Aborted,
+                    GenerateError::Other(e) => StepOutcome::Error {
+                        message: format!("generation failed: {e:#}"),
+                        step: None,
+                    },
+                })
+            })?;
         let parsed = parse_output(&generated_text);
         Ok(AttemptOutput {
-            prompt_tokens,
+            prompt,
             generated_text,
             parsed,
         })
@@ -668,7 +598,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
     /// [`RETRY_NOTE`] once `self.max_retries` is exhausted. A call
     /// identical (same name+args) to one already made earlier this turn is
     /// never re-executed (the repeated-call loop guard).
-    fn step_inner(&mut self) -> StepOutcome {
+    async fn step_inner(&mut self) -> StepOutcome {
         if self.step_index >= self.max_steps {
             return StepOutcome::Error {
                 message: format!(
@@ -683,14 +613,9 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         let mut retries = 0usize;
         let mut repeat_guard = false;
         loop {
-            let attempt = match self.generate_attempt() {
+            let attempt = match self.generate_attempt().await {
                 Ok(a) => a,
-                Err(message) => {
-                    return StepOutcome::Error {
-                        message,
-                        step: None,
-                    }
-                }
+                Err(outcome) => return *outcome,
             };
 
             let empty_calls =
@@ -719,7 +644,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                     continue;
                 }
                 if is_repeat || empty_calls {
-                    return self.force_final_answer(repeat_guard);
+                    return self.force_final_answer(repeat_guard).await;
                 }
                 return StepOutcome::Error {
                     message: "model produced no valid call".to_string(),
@@ -728,7 +653,7 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             }
 
             let AttemptOutput {
-                prompt_tokens,
+                prompt,
                 generated_text,
                 parsed,
             } = attempt;
@@ -738,13 +663,13 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             return match parsed {
                 ParsedOutput::ToolCalls(calls) => {
                     let pending = pending_calls_from(&calls);
-                    let entries = tool_call_entries(&pending);
-                    self.messages.push(Message::assistant_tool_calls(entries));
+                    self.messages
+                        .push(Message::assistant_tool_calls("", chat_tool_calls(&pending)));
                     self.pending_calls = pending.clone();
                     self.calls_made_this_turn.extend(calls.iter().cloned());
 
                     let step = Step {
-                        prompt_tokens,
+                        prompt,
                         generated_text,
                         parsed: ParsedOutput::ToolCalls(calls),
                         retries,
@@ -758,9 +683,9 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                     }
                 }
                 ParsedOutput::Text(text) => {
-                    self.messages.push(Message::assistant_text(&text));
+                    self.messages.push(Message::assistant(&text));
                     let step = Step {
-                        prompt_tokens,
+                        prompt,
                         generated_text,
                         parsed: ParsedOutput::Text(text.clone()),
                         retries,
@@ -778,21 +703,16 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
     /// empty tool call: nudge once more and accept whatever text comes
     /// back (falling back to the raw output if the model still emits a
     /// tool call, rather than looping forever).
-    fn force_final_answer(&mut self, repeat_guard: bool) -> StepOutcome {
+    async fn force_final_answer(&mut self, repeat_guard: bool) -> StepOutcome {
         self.messages.push(Message::user(
             "Give your final answer as plain text now, with no tool call.",
         ));
-        let attempt = match self.generate_attempt() {
+        let attempt = match self.generate_attempt().await {
             Ok(a) => a,
-            Err(message) => {
-                return StepOutcome::Error {
-                    message,
-                    step: None,
-                }
-            }
+            Err(outcome) => return *outcome,
         };
         let AttemptOutput {
-            prompt_tokens,
+            prompt,
             generated_text,
             parsed,
         } = attempt;
@@ -800,9 +720,9 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
             Ok(ParsedOutput::Text(t)) => t,
             _ => generated_text.clone(),
         };
-        self.messages.push(Message::assistant_text(&text));
+        self.messages.push(Message::assistant(&text));
         let step = Step {
-            prompt_tokens,
+            prompt,
             generated_text,
             parsed: ParsedOutput::Text(text.clone()),
             retries: self.max_retries,
@@ -813,12 +733,17 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         StepOutcome::Final { text, step }
     }
 
-    /// Synchronous convenience for native callers (tests, eval, a CLI)
-    /// with a synchronous `ToolCaller`: runs the whole turn to completion.
-    pub fn run(&mut self, utterance: &str, tools: &[Tool], max_steps: usize) -> Result<Transcript> {
+    /// Convenience for callers with a synchronous `ToolCaller` (tests,
+    /// eval, a CLI): runs the whole turn to completion.
+    pub async fn run(
+        &mut self,
+        utterance: &str,
+        tools: &[Tool],
+        max_steps: usize,
+    ) -> Result<Transcript> {
         self.max_steps = max_steps;
         let mut steps = Vec::with_capacity(max_steps);
-        let mut outcome = self.start(utterance, tools);
+        let mut outcome = self.start(utterance, tools).await;
 
         loop {
             match outcome {
@@ -836,8 +761,12 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                         let result = self.caller.call(&call.name, &call.arguments)?;
                         results.push((call.call_id.clone(), result));
                     }
-                    outcome = self.provide_tool_results(results);
+                    outcome = self.provide_tool_results(results).await;
                 }
+                StepOutcome::ContextOverflow { needed, available } => {
+                    bail!("context overflow: needed {needed} tokens, {available} available");
+                }
+                StepOutcome::Aborted => bail!("aborted"),
                 StepOutcome::Error { message, step } => {
                     if let Some(step) = step {
                         steps.push(step);
@@ -861,16 +790,10 @@ fn pending_calls_from(calls: &[ToolCall]) -> Vec<PendingToolCall> {
         .collect()
 }
 
-fn tool_call_entries(pending: &[PendingToolCall]) -> Vec<ToolCallEntry> {
+fn chat_tool_calls(pending: &[PendingToolCall]) -> Vec<lean_chat::ToolCall> {
     pending
         .iter()
-        .map(|c| ToolCallEntry {
-            kind: "function".to_string(),
-            function: ToolCallFunction {
-                name: c.name.clone(),
-                arguments: c.arguments.clone(),
-            },
-        })
+        .map(|c| lean_chat::ToolCall::new(c.name.clone(), c.arguments.clone()))
         .collect()
 }
 
@@ -893,9 +816,9 @@ mod tests {
 
     #[test]
     fn renders_tools_preamble_and_single_user_turn() {
-        let tmpl = AgentChatTemplate::new(QWEN25_TOOLS_TEMPLATE).unwrap();
+        let tmpl = ChatTemplate::new(QWEN25_TOOLS_TEMPLATE);
         let messages = vec![Message::user("What's the weather in Paris?")];
-        let out = tmpl.render(&messages, &[weather_tool()], true).unwrap();
+        let out = render_prompt(&tmpl, &messages, &[weather_tool()]).unwrap();
         assert!(out.starts_with("<|im_start|>system\n"));
         assert!(out.contains(
             "<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\""
@@ -906,22 +829,22 @@ mod tests {
 
     #[test]
     fn renders_multiturn_with_tool_call_and_result() {
-        let tmpl = AgentChatTemplate::new(QWEN25_TOOLS_TEMPLATE).unwrap();
+        let tmpl = ChatTemplate::new(QWEN25_TOOLS_TEMPLATE);
         let messages = vec![
             Message::user("What's the weather in Paris?"),
-            Message::assistant_tool_calls(vec![ToolCallEntry {
-                kind: "function".into(),
-                function: ToolCallFunction {
-                    name: "get_weather".into(),
-                    arguments: serde_json::json!({"city": "Paris"}),
-                },
-            }]),
+            Message::assistant_tool_calls(
+                "",
+                vec![lean_chat::ToolCall::new(
+                    "get_weather",
+                    serde_json::json!({"city": "Paris"}),
+                )],
+            ),
             format_tool_result(
                 "get_weather",
                 &serde_json::json!({"temp_c": 14, "condition": "cloudy"}),
             ),
         ];
-        let out = tmpl.render(&messages, &[weather_tool()], true).unwrap();
+        let out = render_prompt(&tmpl, &messages, &[weather_tool()]).unwrap();
         assert!(out.contains("<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>"));
         assert!(out.contains(
             "<tool_response>\n{\"temp_c\": 14, \"condition\": \"cloudy\"}\n</tool_response>"
@@ -979,12 +902,7 @@ mod tests {
             "get_weather",
             &serde_json::json!({"body": "{\n  \"temp_c\": 14\n}"}),
         );
-        assert_eq!(
-            msg.content,
-            Some(Value::String(
-                "{\"body\": \"{\\\"temp_c\\\": 14}\"}".to_string()
-            ))
-        );
+        assert_eq!(msg.content, "{\"body\": \"{\\\"temp_c\\\": 14}\"}");
     }
 
     #[test]
@@ -1003,48 +921,56 @@ mod tests {
         }
     }
 
-    fn id(tokenizer: &tokenizers::Tokenizer, s: &str) -> Vec<u32> {
-        tokenizer.encode(s, false).unwrap().get_ids().to_vec()
-    }
-
     /// End-to-end step-wise loop against a scripted `FixtureGenerator`: the
     /// model calls a tool, gets a result, then answers in text.
     #[test]
     fn agent_loop_calls_tool_then_answers() {
-        // No pre-tokenizer: each whole turn is one atomic vocab entry, so
-        // encode/decode round-trips it exactly. This test only exercises
-        // the loop's control flow, not real subword tokenization.
         let tool_call_text = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>";
         let answer_text = "It is cloudy.";
-        let vocab = [(tool_call_text, 0u32), (answer_text, 1), ("<unk>", 2)];
-        let model = tokenizers::models::wordlevel::WordLevel::builder()
-            .vocab(vocab.iter().map(|(s, i)| (s.to_string(), *i)).collect())
-            .unk_token("<unk>".into())
-            .build()
-            .unwrap();
-        let tokenizer = tokenizers::Tokenizer::new(model);
-
-        let tool_call_ids = id(&tokenizer, tool_call_text);
-        let answer_ids = id(&tokenizer, answer_text);
-
-        let generator = FixtureGenerator::new(vec![tool_call_ids, answer_ids]);
-        let template = AgentChatTemplate::new(QWEN25_TOOLS_TEMPLATE).unwrap();
+        let generator =
+            FixtureGenerator::new(vec![tool_call_text.to_string(), answer_text.to_string()]);
+        let template = ChatTemplate::new(QWEN25_TOOLS_TEMPLATE);
         let mut agent = Agent::new(
             template,
-            tokenizer,
             generator,
             EchoCaller,
             "You are a helpful assistant.",
             64,
         );
 
-        let transcript = agent
-            .run("What's the weather in Paris?", &[weather_tool()], 4)
-            .unwrap();
+        let transcript =
+            pollster::block_on(agent.run("What's the weather in Paris?", &[weather_tool()], 4))
+                .unwrap();
         assert_eq!(transcript.steps.len(), 2);
         assert!(
             matches!(&transcript.steps[0].parsed, ParsedOutput::ToolCalls(calls) if calls.len() == 1 && calls[0].name == "get_weather")
         );
         assert!(matches!(&transcript.steps[1].parsed, ParsedOutput::Text(_)));
+        assert!(transcript.steps[1].prompt.contains(
+            "<tool_response>\n{\"called\": \"get_weather\", \"with\": {\"city\": \"Paris\"}}\n</tool_response>"
+        ));
+        assert_eq!(transcript.final_text, answer_text);
+    }
+
+    #[test]
+    fn streams_text_and_abort_stops_the_turn() {
+        let generator = FixtureGenerator::new(vec!["Hello.".to_string()]);
+        let mut agent = Agent::new(
+            ChatTemplate::new(QWEN25_TOOLS_TEMPLATE),
+            generator,
+            EchoCaller,
+            "You are a helpful assistant.",
+            64,
+        );
+        let streamed = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let sink = streamed.clone();
+        agent.set_on_text(move |t| sink.borrow_mut().push_str(t));
+        let first = pollster::block_on(agent.start("hi", &[weather_tool()]));
+        assert!(matches!(first, StepOutcome::Final { .. }), "{first:?}");
+        assert_eq!(*streamed.borrow(), "Hello.");
+
+        agent.abort_flag().abort();
+        let outcome = pollster::block_on(agent.provide_tool_results(Vec::new()));
+        assert!(matches!(outcome, StepOutcome::Aborted), "{outcome:?}");
     }
 }

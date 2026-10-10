@@ -9,8 +9,7 @@ dependencies = [
  "anyhow",
  "clap",
  "lean",
- "minijinja",
- "minijinja-contrib",
+ "lean-chat",
  "pollster",
  "serde",
  "serde_json",
@@ -26,10 +25,10 @@ dependencies = [
  "console_error_panic_hook",
  "js-sys",
  "lean",
+ "lean-chat",
  "serde_json",
- "tokenizers",
  "wasm-bindgen",
- "web-sys",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]
@@ -787,26 +786,51 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 [[package]]
 name = "lean"
 version = "0.1.0"
-source = "git+https://github.com/idle-intelligence/llm-web?rev=b321c16117cc2aef425c6471cbcb4cd7257fe518#b321c16117cc2aef425c6471cbcb4cd7257fe518"
+source = "git+https://github.com/idle-intelligence/llm-web?rev=1fce23d866c23fb6f3635abb51db52c50ff87808#1fce23d866c23fb6f3635abb51db52c50ff87808"
 dependencies = [
  "anyhow",
- "bytemuck",
- "byteorder",
- "clap",
  "console_error_panic_hook",
- "futures-channel",
  "getrandom",
- "half",
  "js-sys",
- "minijinja",
- "minijinja-contrib",
- "pollster",
+ "lean-chat",
+ "lean-core",
+ "rayon",
  "serde",
  "serde_json",
  "tokenizers",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "wgpu",
+]
+
+[[package]]
+name = "lean-chat"
+version = "0.1.0"
+source = "git+https://github.com/idle-intelligence/llm-web?rev=1fce23d866c23fb6f3635abb51db52c50ff87808#1fce23d866c23fb6f3635abb51db52c50ff87808"
+dependencies = [
+ "anyhow",
+ "js-sys",
+ "minijinja",
+ "minijinja-contrib",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "lean-core"
+version = "0.1.0"
+source = "git+https://github.com/idle-intelligence/llm-web?rev=1fce23d866c23fb6f3635abb51db52c50ff87808#1fce23d866c23fb6f3635abb51db52c50ff87808"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "byteorder",
+ "futures-channel",
+ "half",
+ "pollster",
+ "rayon",
+ "wasm-bindgen",
  "wgpu",
 ]
 
