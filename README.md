@@ -2,19 +2,19 @@
 
 A tool-calling agent for Qwen2.5-Instruct models, running on the [lean](https://github.com/idle-intelligence/llm-web) inference engine.
 
-lean is inference only: it loads weights, tokenizes, runs the model forward pass, and picks a backend (WebGPU, then CPU threads, then a single CPU thread) by capability. Everything an agent needs on top of that, the tool-calling chat template, output parsing, the step-wise loop, and an eval harness, lives here instead.
+lean is inference only: text in, text out, on a backend it picks by capability (WebGPU, then CPU threads, then a single CPU thread). Its chat layer, lean-chat, renders messages and tools into prompt text with the model's own chat template. Everything an agent needs on top of that, output parsing, the step-wise loop, and an eval harness, lives here instead. The loop reaches the model through one small trait (prompt text in, streamed text out, abort, a typed context-overflow error), so any engine that completes text can drive it.
 
 ## What it does
 
-- Renders Qwen2.5-Instruct's own tools chat template (`<tools>...</tools>` in the system turn, `<tool_call>{"name":..., "arguments":...}</tool_call>` in the model's output), token-exact against `transformers.apply_chat_template(..., tools=...)`.
+- Renders each step's prompt with the model's own chat template and the tools through lean-chat (for Qwen2.5-Instruct, `<tools>...</tools>` in the system turn and `<tool_call>{"name":..., "arguments":...}</tool_call>` in the model's output), byte-exact against `transformers.apply_chat_template(..., tools=...)`.
 - Parses the model's tool calls out of its raw output, with a retry policy for malformed or repeated calls.
 - Drives a step-wise loop: render prompt, generate, parse, hand back pending tool calls, accept results, repeat until a final text answer.
 - Scores transcripts against a fixed set of utterance cases (a Sonos speaker-control tool set) under several acceptance modes (exact call sequence, required subset, no mutation, any valid play call).
 
 ## Crates
 
-- `crates/agent`: the template, parser, loop, and eval library. Depends on lean through a pinned git revision.
-- `crates/agent-wasm`: wasm-bindgen bindings for the agent, running on lean's native CPU engine.
+- `crates/agent`: the parser, loop, and eval library, plus `LeanGenerator`, the loop's generator on lean's engine. Depends on lean and lean-chat through a pinned git revision.
+- `crates/agent-wasm`: wasm-bindgen bindings for the agent on lean's engine (WebGPU when the browser grants an adapter, otherwise the CPU).
 - `examples/agent_cli.rs`: a native CLI that runs one utterance through the loop, answering tool calls from fixture JSON, and prints each step.
 - `examples/agent_eval.rs`: a native CLI that runs the full eval set and prints a markdown results table.
 
@@ -34,7 +34,7 @@ LEAN_TOKENIZER_DIR_QWEN25_3B=/path/to/Qwen2.5-3B-Instruct \
 cargo run -p agent --example agent_eval --release
 ```
 
-Both pick lean's GPU engine when a wgpu adapter is available and fall back to the CPU engine otherwise, the same capability-based choice lean's own CLI makes.
+Both load the model with lean's capability ladder: the GPU when a wgpu adapter is available, otherwise the CPU forward pass on every core. Each step reuses the KV cache of the previous one for the prompt prefix they share, so the system prompt and tools are prefilled once per turn.
 
 ## Demo
 
