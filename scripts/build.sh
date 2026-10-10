@@ -20,9 +20,13 @@ ENGINE_BUILD="${ENGINE_BUILD:-dev}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# SIMD128 comes from .cargo/config.toml. The remap flag (keeps the home
+# directory out of compiled-in source paths) is passed with --config, which
+# cargo merges with that file's rustflags; RUSTFLAGS would replace them and
+# drop +simd128.
+REMAP_CONFIG="target.wasm32-unknown-unknown.rustflags=[\"--remap-path-prefix=$HOME=/home\"]"
 echo "==> Building agent-wasm (web feature) for ENGINE_BUILD=$ENGINE_BUILD"
-RUSTFLAGS="-C target-feature=+simd128 --remap-path-prefix=$HOME=/home" \
-  wasm-pack build crates/agent-wasm --target web --release
+wasm-pack build crates/agent-wasm --target web --release --config "$REMAP_CONFIG"
 
 WASM="crates/agent-wasm/pkg/agent_wasm_bg.wasm"
 
