@@ -15,9 +15,12 @@
 //! - `{"type": "error", "message": "..."}`
 //!
 //! Run it in a Web Worker. While `start` or `provideToolResults` is
-//! running, the agent object is busy: stop it through the handle
-//! `abortHandle()` returned before the call, never through the agent
-//! itself.
+//! running, the agent is busy: any other call that needs it (a second
+//! `start`, `provideToolResults`, `setOnText`, `reset`) throws an "agent is
+//! busy" error. `backend` and `abortHandle()` always work; stop a running
+//! step through the handle.
+
+use std::cell::RefCell;
 
 use wasm_bindgen::prelude::*;
 
@@ -60,7 +63,10 @@ impl AgentAbort {
 
 #[wasm_bindgen(js_name = Agent)]
 pub struct AgentJs {
-    agent: Agent<LeanGenerator>,
+    /// `None` while a step runs.
+    agent: RefCell<Option<Agent<LeanGenerator>>>,
+    backend: &'static str,
+    abort: AbortFlag,
 }
 
 #[wasm_bindgen(js_class = Agent)]
@@ -89,24 +95,31 @@ impl AgentJs {
         })
         .await
         .map_err(|e| JsError::new(&format!("failed to load model: {e}")))?;
+        let backend = generator.backend();
+        let agent = Agent::new(template, generator, system_prompt, max_new_tokens as usize);
         Ok(AgentJs {
-            agent: Agent::new(template, generator, system_prompt, max_new_tokens as usize),
+            abort: agent.abort_flag(),
+            agent: RefCell::new(Some(agent)),
+            backend,
         })
     }
 
     /// The backend lean picked: `"webgpu"`, `"threads"` or `"single"`.
     #[wasm_bindgen(getter)]
     pub fn backend(&self) -> String {
-        self.agent.generator().backend().to_string()
+        self.backend.to_string()
     }
 
     /// `on_text(text)` receives the model's raw output as it is generated,
     /// every step. It must not call this agent.
     #[wasm_bindgen(js_name = setOnText)]
-    pub fn set_on_text(&mut self, on_text: js_sys::Function) {
-        self.agent.set_on_text(move |text| {
+    pub fn set_on_text(&self, on_text: js_sys::Function) -> Result<(), JsError> {
+        let mut agent = self.take()?;
+        agent.set_on_text(move |text| {
             let _ = on_text.call1(&JsValue::NULL, &JsValue::from_str(text));
         });
+        self.put(agent);
+        Ok(())
     }
 
     /// A handle whose `abort()` stops the running step (it resolves to an
@@ -114,22 +127,19 @@ impl AgentJs {
     /// for every later turn.
     #[wasm_bindgen(js_name = abortHandle)]
     pub fn abort_handle(&self) -> AgentAbort {
-        AgentAbort(self.agent.abort_flag())
+        AgentAbort(self.abort.clone())
     }
 
     /// Begin a new turn. `tools_json` is a JSON array of MCP `tools/list`
     /// entries (`{"name", "description", "inputSchema"}`); pass `"[]"` for
     /// no tools. Resolves to one outcome JSON object, see the module doc.
-    pub async fn start(
-        &mut self,
-        utterance: String,
-        tools_json: String,
-    ) -> Result<String, JsError> {
+    pub async fn start(&self, utterance: String, tools_json: String) -> Result<String, JsError> {
         let raw_tools: Vec<Value> = serde_json::from_str(&tools_json)
             .map_err(|e| JsError::new(&format!("invalid tools JSON: {e}")))?;
-        Ok(outcome_to_json(
-            self.agent.start_from_mcp(&utterance, &raw_tools).await,
-        ))
+        let mut agent = self.take()?;
+        let outcome = agent.start_from_mcp(&utterance, &raw_tools).await;
+        self.put(agent);
+        Ok(outcome_to_json(outcome))
     }
 
     /// Continue the turn with tool results. `results_json` is a JSON array
@@ -138,17 +148,36 @@ impl AgentJs {
     /// as an error). Resolves to one outcome JSON object, same shape as
     /// `start`.
     #[wasm_bindgen(js_name = provideToolResults)]
-    pub async fn provide_tool_results(&mut self, results_json: String) -> Result<String, JsError> {
+    pub async fn provide_tool_results(&self, results_json: String) -> Result<String, JsError> {
         let results: Vec<(String, Value)> = serde_json::from_str(&results_json)
             .map_err(|e| JsError::new(&format!("invalid results JSON: {e}")))?;
-        Ok(outcome_to_json(
-            self.agent.provide_tool_results(results).await,
-        ))
+        let mut agent = self.take()?;
+        let outcome = agent.provide_tool_results(results).await;
+        self.put(agent);
+        Ok(outcome_to_json(outcome))
     }
 
     /// Abandon the current turn (e.g. after an `error` outcome) without
     /// reloading the model.
-    pub fn reset(&mut self) {
-        self.agent.reset();
+    pub fn reset(&self) -> Result<(), JsError> {
+        let mut agent = self.take()?;
+        agent.reset();
+        self.put(agent);
+        Ok(())
+    }
+}
+
+impl AgentJs {
+    /// The agent, out of its cell for the duration of one call; an error
+    /// while another call holds it.
+    fn take(&self) -> Result<Agent<LeanGenerator>, JsError> {
+        self.agent
+            .borrow_mut()
+            .take()
+            .ok_or_else(|| JsError::new("agent is busy: a step is still running"))
+    }
+
+    fn put(&self, agent: Agent<LeanGenerator>) {
+        *self.agent.borrow_mut() = Some(agent);
     }
 }
