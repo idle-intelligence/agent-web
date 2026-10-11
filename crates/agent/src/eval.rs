@@ -254,10 +254,9 @@ pub fn score(
                     "all required (mutating) calls made in order with correct args".to_string(),
                 )
             } else {
-                let last = case
-                    .expected
-                    .last()
-                    .expect("EvalCase.expected is never empty");
+                let Some(last) = case.expected.last() else {
+                    return (false, "subset mode: the case expects no call".to_string());
+                };
                 if calls_made
                     .iter()
                     .any(|c| c.name == last.name && args_match(&last.args, &c.arguments))
@@ -535,4 +534,180 @@ pub fn render_markdown(report: &EvalReport) -> String {
     let _ = writeln!(out, "**Summary**: correct {:.1}% ({} scored, {} skipped), mean_steps {:.2}, mean_total_s {:.3}, total_retries {}, total_tool_errors {}", report.correct_pct, scored, skipped, report.mean_steps, report.mean_total_s, report.total_retries, report.total_tool_errors);
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::ChatTemplate;
+    use crate::test_support::FakeGenerator;
+    use serde_json::json;
+
+    const QWEN25_TOOLS_TEMPLATE: &str =
+        include_str!("../tests/fixtures/qwen25_chat_template.jinja");
+    const REPO_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+
+    fn fixtures_dir() -> String {
+        format!("{REPO_ROOT}/crates/agent/fixtures/sonos")
+    }
+
+    fn cases() -> Vec<EvalCase> {
+        load_cases(format!("{REPO_ROOT}/eval/utterances.json")).unwrap()
+    }
+
+    fn case(id: &str) -> EvalCase {
+        cases().into_iter().find(|c| c.id == id).unwrap()
+    }
+
+    fn call(name: &str, arguments: Value) -> ToolCall {
+        ToolCall {
+            name: name.to_string(),
+            arguments,
+        }
+    }
+
+    fn households() -> Value {
+        let path = format!(
+            "{}/results/get_households_and_groups_and_players.json",
+            fixtures_dir()
+        );
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn eval_set_has_46_cases_33_solvable_with_the_subset() {
+        let cases = cases();
+        assert_eq!(cases.len(), 46);
+        assert_eq!(cases.iter().filter(|c| c.subset_ok).count(), 33);
+        let mut ids: Vec<&str> = cases.iter().map(|c| c.id.as_str()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 46, "case ids are unique");
+
+        let all = load_all_tools(fixtures_dir()).unwrap();
+        let subset = select_tools(&all, ToolSet::Subset, fixtures_dir()).unwrap();
+        assert_eq!(all.len(), 34);
+        assert_eq!(subset.len(), 13);
+        let has = |tools: &[Tool], name: &str| tools.iter().any(|t| t.function.name == name);
+        for c in &cases {
+            for e in &c.expected {
+                assert!(has(&all, &e.name), "{}: unknown tool {}", c.id, e.name);
+            }
+            let solvable = c.expected.iter().all(|e| has(&subset, &e.name));
+            assert_eq!(solvable, c.subset_ok, "{}: subset_ok", c.id);
+        }
+    }
+
+    #[test]
+    fn exact_mode_needs_the_same_calls() {
+        let c = case("s02");
+        let listing = call("get_households_and_groups_and_players", json!({}));
+        assert!(score(&c, std::slice::from_ref(&listing), None, true).0);
+        assert!(!score(&c, &[listing.clone(), listing], None, true).0);
+        assert!(!score(&c, &[call("get_now_playing", json!({}))], None, true).0);
+    }
+
+    #[test]
+    fn subset_mode_needs_the_mutating_calls_in_order() {
+        let c = case("m01");
+        let pause = call(
+            "pause",
+            json!({"group_id": "RINCON_KITCHEN01:1", "extra": 1}),
+        );
+        assert!(score(&c, std::slice::from_ref(&pause), None, true).0);
+        assert!(
+            !score(
+                &c,
+                &[call("pause", json!({"group_id": "RINCON_LIVING01:2"}))],
+                None,
+                true
+            )
+            .0
+        );
+        assert!(!score(&c, &[], None, true).0);
+    }
+
+    #[test]
+    fn subset_mode_with_only_reads_needs_the_final_read() {
+        let c = case("m07");
+        let read = call(
+            "get_group_volume",
+            json!({"group_id": "RINCON_BEDROOM01:3"}),
+        );
+        assert!(score(&c, &[read], None, true).0);
+        assert!(
+            !score(
+                &c,
+                &[call("get_group_volume", json!({"group_id": "x"}))],
+                None,
+                true
+            )
+            .0
+        );
+    }
+
+    #[test]
+    fn no_mutation_mode_needs_a_text_answer_and_no_mutating_call() {
+        let c = case("m21");
+        let listing = call("get_households_and_groups_and_players", json!({}));
+        assert!(score(&c, std::slice::from_ref(&listing), None, true).0);
+        assert!(!score(&c, std::slice::from_ref(&listing), None, false).0);
+        assert!(
+            !score(
+                &c,
+                &[call("pause", json!({"group_id": "garage"}))],
+                None,
+                true
+            )
+            .0
+        );
+    }
+
+    #[test]
+    fn any_play_mode_needs_a_known_group_id() {
+        let c = case("m22");
+        let households = households();
+        let play = |group: &str| {
+            call(
+                "play_sonos_favorite",
+                json!({"group_id": group, "favorite_id": "FV:1", "shuffle": false}),
+            )
+        };
+        assert!(score(&c, &[play("RINCON_KITCHEN01:1")], Some(&households), true).0);
+        assert!(!score(&c, &[play("garage")], Some(&households), true).0);
+        assert!(!score(&c, &[play("RINCON_KITCHEN01:1")], None, true).0);
+        let mcp_shaped = json!({"content": [{"type": "text", "text": households.to_string()}]});
+        assert!(score(&c, &[play("RINCON_KITCHEN01:1")], Some(&mcp_shaped), true).0);
+    }
+
+    #[test]
+    fn too_many_calls_fail_any_mode() {
+        let c = case("m01");
+        let pause = call("pause", json!({"group_id": "RINCON_KITCHEN01:1"}));
+        let calls = vec![pause; MAX_TOOL_CALLS + 1];
+        assert!(!score(&c, &calls, None, true).0);
+    }
+
+    #[test]
+    fn run_case_scores_a_scripted_run() {
+        let generator = FakeGenerator::script(&[
+            "<tool_call>\n{\"name\": \"get_households_and_groups_and_players\"}\n</tool_call>",
+            "<tool_call>\n{\"name\": \"pause\", \"arguments\": {\"group_id\": \"RINCON_KITCHEN01:1\"}}\n</tool_call>",
+            "The kitchen is paused.",
+        ]);
+        let mut agent = Agent::new(
+            ChatTemplate::new(QWEN25_TOOLS_TEMPLATE),
+            generator,
+            "You are a helpful home assistant.",
+            64,
+        );
+        let all = load_all_tools(fixtures_dir()).unwrap();
+        let tools = select_tools(&all, ToolSet::Subset, fixtures_dir()).unwrap();
+        let mut caller = FixtureCaller::new(format!("{}/results", fixtures_dir()));
+        let result = pollster::block_on(run_case(&mut agent, &tools, &case("m01"), &mut caller));
+        assert!(result.correct, "{}", result.reason);
+        assert_eq!(result.steps, 3);
+        assert_eq!(result.calls_made.len(), 2);
+        assert_eq!(result.tool_errors, 0);
+    }
 }
