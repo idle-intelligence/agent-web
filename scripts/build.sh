@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
-# Builds the agent-wasm package and assembles the deployed site into
-# _site/, following the pattern of llm-web's scripts/build.sh (build tag
-# rewrite, local-path leak check on the built wasm).
-#
-# The web/ page (phase 2 of this repo) is not built yet; this currently
-# just builds and checks the wasm package at _site/pkg. Once web/ exists,
-# add its copy and ENGINE_BUILD rewrite here, following llm-web's script.
+# Builds the agent-wasm package, checks the built wasm for local paths, and
+# copies the package to _site/pkg.
 #
 # Requires wasm-pack and wasm-bindgen-cli (version matching Cargo.lock's
 # wasm-bindgen exactly: `cargo install wasm-bindgen-cli --version <ver>
@@ -20,9 +15,13 @@ ENGINE_BUILD="${ENGINE_BUILD:-dev}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# SIMD128 comes from .cargo/config.toml. The remap flag (keeps the home
+# directory out of compiled-in source paths) is passed with --config, which
+# cargo merges with that file's rustflags; RUSTFLAGS would replace them and
+# drop +simd128.
+REMAP_CONFIG="target.wasm32-unknown-unknown.rustflags=[\"--remap-path-prefix=$HOME=/home\"]"
 echo "==> Building agent-wasm (web feature) for ENGINE_BUILD=$ENGINE_BUILD"
-RUSTFLAGS="-C target-feature=+simd128 --remap-path-prefix=$HOME=/home" \
-  wasm-pack build crates/agent-wasm --target web --release
+wasm-pack build crates/agent-wasm --target web --release --config "$REMAP_CONFIG"
 
 WASM="crates/agent-wasm/pkg/agent_wasm_bg.wasm"
 
@@ -40,4 +39,4 @@ rm -rf _site
 mkdir -p _site/pkg
 cp -R crates/agent-wasm/pkg/. _site/pkg/
 
-echo "==> Wrote _site (pkg only; no page yet, see this script's header)"
+echo "==> Wrote _site/pkg"

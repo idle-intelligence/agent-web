@@ -1,9 +1,10 @@
 //! End-to-end smoke test of the agent loop against the real
-//! Qwen2.5-3B-Instruct model on lean's native CPU engine: the model must
+//! Qwen2.5-3B-Instruct model on lean's engine (backend picked by
+//! capability: GPU when a wgpu adapter is available, else CPU): the model must
 //! pick the one tool it's given and call it, then answer in text once it
 //! has the result. Doesn't assert on the wording of the final answer
 //! (that's a model-quality question, not a correctness one); see
-//! `docs/runs/2026-10-07-mcp-agent-lean.md` for scored eval runs.
+//! `docs/runs/` for scored eval runs.
 //!
 //! Ignored by default (needs the GGUF + tokenizer files on disk):
 //!
@@ -13,8 +14,9 @@
 //! cargo test -p agent --release -- --ignored agent_live
 //! ```
 
-use agent::agent::{Agent, AgentChatTemplate, ParsedOutput, ToolCaller};
-use agent::backend::CpuGenerator;
+use agent::agent::{Agent, ParsedOutput, ToolCaller};
+use agent::lean_generator::LeanGenerator;
+use lean::{Backend, GgufSource, LoadOptions, TokenizerSource};
 use serde_json::{json, Value};
 
 struct WeatherCaller;
@@ -29,18 +31,14 @@ impl ToolCaller for WeatherCaller {
 
 #[test]
 #[ignore = "needs LEAN_GGUF_QWEN25_3B (GGUF path) and LEAN_TOKENIZER_DIR_QWEN25_3B (dir with tokenizer.json + tokenizer_config.json) on disk; never committed to this repo"]
-fn agent_cpu_live_calls_tool_then_answers() {
+fn agent_live_calls_tool_then_answers() {
     let gguf_path =
         std::env::var("LEAN_GGUF_QWEN25_3B").expect("set LEAN_GGUF_QWEN25_3B to run this test");
     let tokenizer_dir = std::env::var("LEAN_TOKENIZER_DIR_QWEN25_3B")
         .expect("set LEAN_TOKENIZER_DIR_QWEN25_3B to run this test");
 
-    let tokenizer = tokenizers::Tokenizer::from_file(format!("{tokenizer_dir}/tokenizer.json"))
-        .expect("loading tokenizer.json");
-    let cfg_json = std::fs::read_to_string(format!("{tokenizer_dir}/tokenizer_config.json"))
-        .expect("reading tokenizer_config.json");
-    let template =
-        AgentChatTemplate::from_tokenizer_config_json(&cfg_json).expect("compiling chat_template");
+    let template = lean_chat::read_chat_template(&format!("{tokenizer_dir}/tokenizer_config.json"))
+        .expect("reading the chat template");
 
     let tool = agent::agent::Tool::from_mcp(
         "get_weather",
@@ -48,19 +46,28 @@ fn agent_cpu_live_calls_tool_then_answers() {
         json!({"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}),
     );
 
-    let generator = CpuGenerator::load(&gguf_path).expect("loading GGUF");
+    let generator = pollster::block_on(LeanGenerator::load(LoadOptions {
+        gguf: GgufSource::Path(gguf_path),
+        tokenizer: TokenizerSource::Path(format!("{tokenizer_dir}/tokenizer.json")),
+        max_ctx: 2048,
+        backend: Backend::Auto,
+    }))
+    .expect("loading the model");
+    println!("backend: {}", generator.backend());
     let mut agent = Agent::new(
         template,
-        tokenizer,
         generator,
-        WeatherCaller,
         "You are a helpful assistant with access to tools. Use them when needed.",
         96,
     );
 
-    let transcript = agent
-        .run("What's the weather like in Paris right now?", &[tool], 4)
-        .expect("agent run failed");
+    agent.set_max_steps(4);
+    let transcript = pollster::block_on(agent.run(
+        "What's the weather like in Paris right now?",
+        &[tool],
+        &mut WeatherCaller,
+    ))
+    .expect("agent run failed");
 
     assert!(!transcript.steps.is_empty());
     let first = &transcript.steps[0];

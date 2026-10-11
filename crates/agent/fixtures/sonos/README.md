@@ -1,17 +1,20 @@
 # Sonos MCP tool schemas
 
-Tool schemas of the Sonos MCP server (34 tools) in `tools/list` shape: name, description and inputSchema.
+Tool schemas of the Sonos MCP server, 34 tools, with each tool's name,
+description and input schema copied verbatim, in MCP `tools/list` shape.
+They were not captured from a raw `tools/list` response, so wire-level
+details (extra fields, key names) may differ from what a server sends.
 
 ## Files
 
-- `tools.json` , all 34 tools, MCP `tools/list`-shaped:
+- `tools.json`: all 34 tools, MCP `tools/list`-shaped:
   `[{"name", "description", "inputSchema"}, ...]`.
-- `tools-12.json` , the 12-tool subset used for the tool-count experiment
+- `tools-subset.json`: the 13-tool subset the eval runs with
   (`get_households_and_groups_and_players`, `get_now_playing`, `pause`,
   `resume`, `skip_to_next_track`, `skip_to_previous_track`,
   `set_group_volume`, `adjust_group_volume`, `get_group_volume`,
-  `set_group_mute`, `get_sonos_favorites`, `play_sonos_favorite`) , same
-  entries as in `tools.json`, verbatim.
+  `set_group_mute`, `get_sonos_favorites`, `play_sonos_favorite`), the
+  same entries as in `tools.json`, verbatim, in the order the eval uses.
 
 ## Tool name → required parameters
 
@@ -55,19 +58,13 @@ Tool schemas of the Sonos MCP server (34 tools) in `tools/list` shape: name, des
 Note: `move_audio_to_players` uses `source_group_id` (not `group_id`), and
 several music-service play tools (`play_radio`, `play_station`,
 `play_sonos_favorite` via `favorite_id`, etc.) take extra optional params
-(`music_service`, `artist`, `album`, `shuffle`, etc.) , see `tools.json` for
+(`music_service`, `artist`, `album`, `shuffle`, etc.); see `tools.json` for
 the full schemas.
 
 ## `results/`
 
-One canned JSON file per tool, `results/<tool>.json`, the bare return
-value for that call against the household above (not per-argument). These
-files stay in the bare/parsed shape shown by `cat`ing them , but
-`agent::FixtureCaller::call` (`crates/agent/src/agent.rs`) doesn't hand
-that value back as-is: it wraps it as a real MCP `tools/call` result,
-`{"content":[{"type":"text","text":"<json>"}]}`, with the payload
-pretty-printed (2-space indent) the way Sonos's server sends it, and (for
-a fixture carrying a top-level `error` field) `isError: true` instead.
-Fixtures are served MCP-shaped; the native eval exercises the same
-parsing path as the browser, rather than a shortcut that only works
-against a pre-parsed value.
+One canned JSON file per tool, `results/<tool>.json`: the bare value that
+call returns against the fixture household (one Kitchen, Living Room and
+Bedroom group each), the same for any arguments. `agent::eval::FixtureCaller`
+returns it as is; the agent reads a result with a top-level non-null
+`error` field, or an MCP result with `isError: true`, as a tool error.

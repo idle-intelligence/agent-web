@@ -1,14 +1,18 @@
-//! A tool-calling agent on top of the lean inference engine.
+//! A tool-calling agent loop that works with any inference engine.
 //!
-//! This crate holds everything the engine itself does not: the
-//! Qwen2.5-Instruct tool-calling chat template and output parser, the
-//! step-wise agent loop, and an offline eval harness. It depends on
-//! lean's public Rust API for the model forward pass, using lean's normal
-//! engine selection (GPU when available, CPU otherwise); it never pins a
-//! backend.
+//! This crate holds everything the engine itself does not: the prompt for
+//! each step (the model's own chat template with the tools, rendered by
+//! lean-chat), the Qwen2.5-Instruct tool-call parser, the step-wise agent
+//! loop, and an offline eval harness. The loop reaches the model only
+//! through the [`generator::Generator`] trait (prompt text in, reply text
+//! out). [`lean_generator::LeanGenerator`] implements it on lean's engine,
+//! which picks its backend by capability.
 
 pub mod agent;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod backend;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod eval;
+pub mod generator;
+#[cfg(feature = "lean")]
+pub mod lean_generator;
+#[cfg(test)]
+mod test_support;

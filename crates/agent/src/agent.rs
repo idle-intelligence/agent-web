@@ -1,102 +1,24 @@
-//! Tool-calling chat template, output parser and step-wise agent loop for
-//! Qwen2.5-Instruct's own tools format: `<tools>...</tools>` in the system
-//! turn, `<tool_call>{"name":..., "arguments":...}</tool_call>` in the
+//! Tool-calling agent loop for Qwen2.5-Instruct's own tools format:
+//! `<tools>...</tools>` in the system turn (rendered by the model's chat
+//! template), `<tool_call>{"name":..., "arguments":...}</tool_call>` in the
 //! model's output.
 //!
-//! This module has no dependency on any particular inference engine: the
-//! loop is driven by the [`Generator`] trait, implemented against lean's
-//! public CPU and GPU APIs in `crate::backend`.
+//! Prompts are rendered with lean-chat (the model's own chat template, byte
+//! for byte what transformers' `apply_chat_template` renders). The loop has
+//! no dependency on any inference engine: it is driven by the
+//! [`Generator`] trait, prompt text in and reply text out.
 
 use anyhow::{bail, Context, Result};
-use minijinja::value::{Kwargs, Value as MjValue};
-use minijinja::{context, Environment};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io;
 
+pub use crate::generator::{AbortFlag, GenerateError, Generator};
+pub use lean_chat::{ChatTemplate, Message};
+
 // ---------------------------------------------------------------------
-// Message / tool-call wire types
+// Tool definitions
 // ---------------------------------------------------------------------
-
-/// A single chat message, matching the fields Qwen2.5-Instruct's tools
-/// template inspects (`role`, `content`, `tool_calls`, `name`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Message {
-    pub role: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ToolCallEntry>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-}
-
-impl Message {
-    pub fn system(content: impl Into<String>) -> Self {
-        Self {
-            role: "system".into(),
-            content: Some(Value::String(content.into())),
-            tool_calls: None,
-            name: None,
-        }
-    }
-
-    pub fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: "user".into(),
-            content: Some(Value::String(content.into())),
-            tool_calls: None,
-            name: None,
-        }
-    }
-
-    pub fn assistant_text(content: impl Into<String>) -> Self {
-        Self {
-            role: "assistant".into(),
-            content: Some(Value::String(content.into())),
-            tool_calls: None,
-            name: None,
-        }
-    }
-
-    pub fn assistant_tool_calls(tool_calls: Vec<ToolCallEntry>) -> Self {
-        Self {
-            role: "assistant".into(),
-            content: None,
-            tool_calls: Some(tool_calls),
-            name: None,
-        }
-    }
-
-    /// A `tool`-role message carrying one call's result (Qwen2.5's
-    /// template wraps every `tool`-role message's content in
-    /// `<tool_response>...</tool_response>`).
-    pub fn tool_result(name: impl Into<String>, content: impl Into<String>) -> Self {
-        Self {
-            role: "tool".into(),
-            content: Some(Value::String(content.into())),
-            tool_calls: None,
-            name: Some(name.into()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ToolCallEntry {
-    #[serde(rename = "type", default = "default_function_kind")]
-    pub kind: String,
-    pub function: ToolCallFunction,
-}
-
-fn default_function_kind() -> String {
-    "function".to_string()
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ToolCallFunction {
-    pub name: String,
-    pub arguments: Value,
-}
 
 /// One entry of the `tools` list, transformers/OpenAI shape:
 /// `{"type": "function", "function": {"name", "description", "parameters"}}`.
@@ -105,6 +27,10 @@ pub struct Tool {
     #[serde(rename = "type", default = "default_function_kind")]
     pub kind: String,
     pub function: ToolFunction,
+}
+
+fn default_function_kind() -> String {
+    "function".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -131,12 +57,39 @@ impl Tool {
             },
         }
     }
+
+    /// Reads one MCP `tools/list` entry. `name` is required; a missing or
+    /// `null` `description` reads as `""` and a missing `inputSchema` as
+    /// an object schema with no properties (both are optional in MCP).
+    pub fn try_from_mcp(entry: &Value) -> Result<Self> {
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .with_context(|| format!("MCP tool entry has no string `name`: {entry}"))?;
+        let description = match entry.get("description") {
+            None | Some(Value::Null) => "",
+            Some(Value::String(s)) => s,
+            Some(other) => bail!("MCP tool `{name}`: `description` is not a string: {other}"),
+        };
+        let input_schema = match entry.get("inputSchema") {
+            None | Some(Value::Null) => serde_json::json!({"type": "object", "properties": {}}),
+            Some(schema @ Value::Object(_)) => schema.clone(),
+            Some(other) => bail!("MCP tool `{name}`: `inputSchema` is not an object: {other}"),
+        };
+        Ok(Tool::from_mcp(name, description, input_schema))
+    }
+}
+
+/// Reads an MCP `tools/list` array with [`Tool::try_from_mcp`]; the first
+/// invalid entry is an error naming it.
+pub fn tools_from_mcp(entries: &[Value]) -> Result<Vec<Tool>> {
+    entries.iter().map(Tool::try_from_mcp).collect()
 }
 
 // ---------------------------------------------------------------------
-// py_tojson: byte-exact `tojson` against Python's `json.dumps` (minijinja's
-// built-in `tojson` HTML-escapes and uses different compact-mode separator
-// spacing, which breaks parity against `transformers.apply_chat_template`).
+// Python `json.dumps` formatting for tool results (the same separators
+// the chat template's `tojson` uses for tool calls), so a tool result
+// reads like the rest of the prompt.
 // ---------------------------------------------------------------------
 
 #[derive(Default)]
@@ -173,79 +126,29 @@ pub(crate) fn to_json_compact_py<T: ?Sized + Serialize>(value: &T) -> Result<Str
     Ok(String::from_utf8(out).expect("serde_json only emits valid UTF-8"))
 }
 
-fn json_error(err: impl std::fmt::Display) -> minijinja::Error {
-    minijinja::Error::new(
-        minijinja::ErrorKind::InvalidOperation,
-        format!("cannot serialize to JSON: {err}"),
-    )
-}
+// ---------------------------------------------------------------------
+// Prompt rendering
+// ---------------------------------------------------------------------
 
-fn py_tojson(value: MjValue, kwargs: Kwargs) -> std::result::Result<MjValue, minijinja::Error> {
-    let indent: Option<usize> = kwargs.get("indent").ok();
-    kwargs.assert_all_used()?;
-
-    let rendered = match indent {
-        Some(indent) => {
-            let mut out = Vec::new();
-            let indentation = " ".repeat(indent);
-            let formatter = serde_json::ser::PrettyFormatter::with_indent(indentation.as_bytes());
-            let mut ser = serde_json::Serializer::with_formatter(&mut out, formatter);
-            serde::Serialize::serialize(&value, &mut ser).map_err(json_error)?;
-            String::from_utf8(out).expect("serde_json only emits valid UTF-8")
-        }
-        None => to_json_compact_py(&value).map_err(json_error)?,
+/// The prompt for the next model turn: `messages` and `tools` through the
+/// model's chat template (lean-chat, byte-exact with transformers'
+/// `apply_chat_template(messages, tools=tools, add_generation_prompt=True)`).
+/// No tools renders like `tools=None`, which skips the tools preamble.
+pub fn render_prompt(
+    template: &ChatTemplate,
+    messages: &[Message],
+    tools: &[Tool],
+) -> Result<String> {
+    let tools: Vec<Value> = tools
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<_, _>>()?;
+    let tools = if tools.is_empty() {
+        None
+    } else {
+        Some(tools.as_slice())
     };
-
-    Ok(MjValue::from_safe_string(rendered))
-}
-
-// ---------------------------------------------------------------------
-// Template: Qwen2.5-Instruct's own `chat_template`, tools-enabled.
-// ---------------------------------------------------------------------
-
-pub struct AgentChatTemplate {
-    env: Environment<'static>,
-}
-
-impl AgentChatTemplate {
-    pub fn new(template_source: impl Into<String>) -> Result<Self> {
-        let mut env = Environment::new();
-        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        env.add_filter("tojson", py_tojson);
-        env.add_template_owned("chat", template_source.into())
-            .context("failed to compile chat_template")?;
-        Ok(Self { env })
-    }
-
-    pub fn from_tokenizer_config_json(tokenizer_config_json: &str) -> Result<Self> {
-        let value: Value = serde_json::from_str(tokenizer_config_json)?;
-        let template_source = value
-            .get("chat_template")
-            .and_then(Value::as_str)
-            .context("tokenizer_config.json has no string 'chat_template' field")?;
-        Self::new(template_source)
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn from_tokenizer_config_path(path: &str) -> Result<Self> {
-        let text = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
-        Self::from_tokenizer_config_json(&text)
-    }
-
-    /// `tools` renders as Jinja `none` when empty, matching
-    /// `transformers.apply_chat_template([...], tools=[])`'s behavior of
-    /// skipping the tool preamble.
-    pub fn render(
-        &self,
-        messages: &[Message],
-        tools: &[Tool],
-        add_generation_prompt: bool,
-    ) -> Result<String> {
-        let tmpl = self.env.get_template("chat").unwrap();
-        let tools_ctx = if tools.is_empty() { None } else { Some(tools) };
-        let rendered = tmpl.render(context! { messages => messages, tools => tools_ctx, add_generation_prompt => add_generation_prompt })?;
-        Ok(rendered)
-    }
+    lean_chat::render(template, messages, tools, true)
 }
 
 // ---------------------------------------------------------------------
@@ -268,7 +171,26 @@ pub enum ParsedOutput {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct RawToolCall {
     name: String,
-    arguments: Value,
+    #[serde(default)]
+    arguments: Option<Value>,
+}
+
+/// A call's `arguments` as a JSON object: missing or `null` is `{}`, and a
+/// string holding a JSON object (double-encoded) is that object.
+fn call_arguments(name: &str, arguments: Option<Value>) -> Result<Value, String> {
+    match arguments {
+        None | Some(Value::Null) => Ok(Value::Object(Default::default())),
+        Some(args @ Value::Object(_)) => Ok(args),
+        Some(Value::String(s)) => match serde_json::from_str::<Value>(&s) {
+            Ok(args @ Value::Object(_)) => Ok(args),
+            _ => Err(format!(
+                "arguments of `{name}` are not a JSON object: {s:?}"
+            )),
+        },
+        Some(other) => Err(format!(
+            "arguments of `{name}` are not a JSON object: {other}"
+        )),
+    }
 }
 
 /// Parse one turn of raw (decoded) model output.
@@ -276,7 +198,7 @@ struct RawToolCall {
 /// - A trailing `<|im_end|>` (and whitespace before it) is stripped first.
 /// - Every `<tool_call>...</tool_call>` block found is parsed as one call;
 ///   a block whose contents don't parse as `{"name", "arguments"}` is an
-///   error, not a panic.
+///   error, not a panic. A call with no `arguments` has empty arguments.
 /// - With no `<tool_call>` block at all, the (trimmed) text is the plain
 ///   answer.
 pub fn parse_output(raw: &str) -> Result<ParsedOutput, String> {
@@ -300,17 +222,20 @@ pub fn parse_output(raw: &str) -> Result<ParsedOutput, String> {
         let body = after_open[..end].trim();
         let raw_call: RawToolCall = serde_json::from_str(body)
             .map_err(|e| format!("malformed tool_call JSON {body:?}: {e}"))?;
+        let arguments = call_arguments(&raw_call.name, raw_call.arguments)?;
         calls.push(ToolCall {
             name: raw_call.name,
-            arguments: raw_call.arguments,
+            arguments,
         });
         rest = &after_open[end + CLOSE.len()..];
     }
     Ok(ParsedOutput::ToolCalls(calls))
 }
 
-/// Above this many characters, a compacted tool result is kept in full
-/// (never truncated) but is worth flagging; see `format_tool_result`.
+/// The default limit on one tool result's formatted content, in bytes. The
+/// agent feeds a larger result back as a tool error saying it was too
+/// large, so one oversized result does not overflow the context; see
+/// [`Agent::set_max_result_chars`].
 pub const MAX_RESULT_CHARS: usize = 8000;
 
 /// If `value` is a string that itself parses as JSON, replace it with a
@@ -338,20 +263,31 @@ fn compact_embedded_json(value: &Value) -> Value {
 
 /// Build the `tool`-role `Message` carrying a tool's result: `content` is
 /// a JSON-encoded string, Python-`json.dumps`-formatted, after first
-/// compacting any pretty-printed JSON embedded in `result`.
+/// compacting any pretty-printed JSON embedded in `result`. The content is
+/// kept whole, whatever its size.
 pub fn format_tool_result(name: &str, result: &Value) -> Message {
     let compacted = compact_embedded_json(result);
     let content = to_json_compact_py(&compacted).unwrap_or_else(|_| result.to_string());
-    if content.len() > MAX_RESULT_CHARS {
-        eprintln!("warning: tool result for {name} is {} chars, over MAX_RESULT_CHARS ({MAX_RESULT_CHARS}); keeping it uncut", content.len());
+    tool_message(name, content)
+}
+
+/// A `tool`-role message carrying one call's result (Qwen2.5's template
+/// wraps its content in `<tool_response>...</tool_response>`).
+fn tool_message(name: &str, content: String) -> Message {
+    Message {
+        name: Some(name.to_string()),
+        ..Message::tool(content)
     }
-    Message::tool_result(name, content)
 }
 
 /// If `result` is an MCP-shaped error (`isError: true` or a top-level
-/// `error` field), extract a human-readable message; `None` otherwise.
+/// `error` field that is not `null` or `false`), extract a human-readable
+/// message; `None` otherwise.
 pub fn tool_error_message(result: &Value) -> Option<String> {
-    if let Some(error) = result.get("error") {
+    if let Some(error) = result
+        .get("error")
+        .filter(|e| !matches!(e, Value::Null | Value::Bool(false)))
+    {
         let message = match error {
             Value::String(s) => s.clone(),
             Value::Object(o) => o
@@ -382,7 +318,7 @@ pub fn tool_error_message(result: &Value) -> Option<String> {
 pub fn format_tool_error(name: &str, message: &str) -> Message {
     let content = to_json_compact_py(&serde_json::json!({ "error": message }))
         .unwrap_or_else(|_| format!("{{\"error\": {message:?}}}"));
-    Message::tool_result(name, content)
+    tool_message(name, content)
 }
 
 // ---------------------------------------------------------------------
@@ -393,73 +329,17 @@ const DEFAULT_MAX_STEPS: usize = 8;
 const DEFAULT_MAX_RETRIES: usize = 2;
 const MAX_CONSECUTIVE_TOOL_ERRORS: usize = 3;
 
-/// A generic, non-committal nudge appended as a `user` message when a
-/// model output is malformed/empty/unknown-tool twice in a row.
+/// The first sentence of the `user` note added to a retry's prompt after
+/// an invalid reply; the note then says what was wrong.
 const RETRY_NOTE: &str = "Respond with a tool call from the list or a final answer.";
+
+/// The `user` note added to the prompt when the retries are spent on
+/// repeated or empty tool calls.
+const FINAL_ANSWER_NOTE: &str = "Give your final answer as plain text now, with no tool call.";
 
 /// Executes one tool call and returns its JSON result.
 pub trait ToolCaller {
     fn call(&mut self, name: &str, args: &Value) -> Result<Value>;
-}
-
-/// Runs the model forward from `prompt_ids`, sampling up to
-/// `max_new_tokens` tokens (fewer if an eos id is hit). Greedy only.
-///
-/// Implementations live in `crate::backend`, built on lean's public CPU
-/// and GPU forward-pass APIs; this trait itself has no engine dependency.
-pub trait Generator {
-    fn generate(&mut self, prompt_ids: &[u32], max_new_tokens: usize) -> Result<Vec<u32>>;
-}
-
-/// A `Generator` that replays a scripted sequence of outputs for tests.
-pub struct FixtureGenerator {
-    script: Vec<Vec<u32>>,
-    next: usize,
-}
-
-impl FixtureGenerator {
-    pub fn new(script: Vec<Vec<u32>>) -> Self {
-        Self { script, next: 0 }
-    }
-}
-
-impl Generator for FixtureGenerator {
-    fn generate(&mut self, _prompt_ids: &[u32], _max_new_tokens: usize) -> Result<Vec<u32>> {
-        let out = self.script.get(self.next).cloned().ok_or_else(|| {
-            anyhow::anyhow!(
-                "FixtureGenerator script exhausted after {} call(s)",
-                self.next
-            )
-        })?;
-        self.next += 1;
-        Ok(out)
-    }
-}
-
-/// A `ToolCaller` that serves canned JSON results from
-/// `<results_dir>/<tool>.json` and records every call it saw, in order.
-pub struct FixtureCaller {
-    results_dir: std::path::PathBuf,
-    pub calls_seen: Vec<(String, Value)>,
-}
-
-impl FixtureCaller {
-    pub fn new(results_dir: impl Into<std::path::PathBuf>) -> Self {
-        Self {
-            results_dir: results_dir.into(),
-            calls_seen: Vec::new(),
-        }
-    }
-}
-
-impl ToolCaller for FixtureCaller {
-    fn call(&mut self, name: &str, args: &Value) -> Result<Value> {
-        self.calls_seen.push((name.to_string(), args.clone()));
-        let path = self.results_dir.join(format!("{name}.json"));
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading fixture result {path:?}"))?;
-        Ok(serde_json::from_str(&text)?)
-    }
 }
 
 /// One tool call the model asked for, awaiting a result via
@@ -474,15 +354,24 @@ pub struct PendingToolCall {
 /// One render -> generate -> parse round of the agent loop.
 #[derive(Debug)]
 pub struct Step {
-    pub prompt_tokens: Vec<u32>,
+    /// The prompt of the accepted attempt.
+    pub prompt: String,
+    /// The model's raw reply to that prompt.
     pub generated_text: String,
     pub parsed: ParsedOutput,
+    /// Attempts regenerated because the reply was invalid or repeated.
     pub retries: usize,
+    /// Tool error results fed back in this step's prompt.
     pub tool_errors: usize,
+    /// Tool results fed back as "too large" errors in this step's prompt.
+    pub oversized_results: usize,
+    /// A reply repeated a call already made this turn.
     pub repeat_guard: bool,
+    /// The step ended with the model asked for a plain-text answer.
     pub forced_text_answer: bool,
 }
 
+#[derive(Debug)]
 pub struct Transcript {
     pub steps: Vec<Step>,
     pub final_text: String,
@@ -498,6 +387,21 @@ pub enum StepOutcome {
         text: String,
         step: Step,
     },
+    /// The prompt no longer fits the engine's context (`needed` tokens,
+    /// `available` in the context). The agent is left as it was before the
+    /// call that returned this: after `start`, call `start` again with
+    /// fewer tools or a shorter utterance; after `provide_tool_results`,
+    /// call it again with smaller results (or errors in their place), or
+    /// lower `max_new_tokens` first.
+    ContextOverflow {
+        needed: usize,
+        available: usize,
+    },
+    /// The turn was stopped through [`Agent::abort_flag`].
+    Aborted,
+    /// The turn cannot go on, except after a `provide_tool_results` whose
+    /// call ids do not match the pending calls: the agent is left as it
+    /// was, and a call with the right ids continues the turn.
     Error {
         message: String,
         step: Option<Step>,
@@ -505,58 +409,88 @@ pub enum StepOutcome {
 }
 
 struct AttemptOutput {
-    prompt_tokens: Vec<u32>,
+    prompt: String,
     generated_text: String,
     parsed: std::result::Result<ParsedOutput, String>,
 }
 
-pub struct Agent<G: Generator, C: ToolCaller> {
-    template: AgentChatTemplate,
-    tokenizer: tokenizers::Tokenizer,
+/// Why a reply was not accepted.
+enum Rejection {
+    /// Unparsable, or a call to a tool that is not in the list.
+    Invalid,
+    /// A `<tool_call>` block with no calls in it.
+    Empty,
+    /// Every call in it was already made this turn.
+    Repeat,
+}
+
+/// Everything a turn changes, saved before a call so a context overflow
+/// can put it back.
+struct TurnState {
+    messages_len: usize,
+    step_index: usize,
+    pending_calls: Vec<PendingToolCall>,
+    consecutive_tool_errors: usize,
+    step_tool_errors: usize,
+    step_oversized_results: usize,
+    calls_made_this_turn: Vec<ToolCall>,
+}
+
+/// The step-wise agent loop over a [`Generator`]. One turn answers one
+/// utterance: [`Agent::start`] begins it (and a new conversation), each
+/// [`StepOutcome::NeedTools`] is answered with
+/// [`Agent::provide_tool_results`], until a final text answer.
+pub struct Agent<G: Generator> {
+    template: ChatTemplate,
     generator: G,
-    caller: C,
     system_prompt: String,
     max_new_tokens: usize,
     max_steps: usize,
     max_retries: usize,
+    max_result_chars: usize,
+    abort: AbortFlag,
+    on_text: Box<dyn FnMut(&str)>,
 
     messages: Vec<Message>,
     tools: Vec<Tool>,
     step_index: usize,
     pending_calls: Vec<PendingToolCall>,
     consecutive_tool_errors: usize,
+    step_tool_errors: usize,
+    step_oversized_results: usize,
     calls_made_this_turn: Vec<ToolCall>,
 }
 
-impl<G: Generator, C: ToolCaller> Agent<G, C> {
+impl<G: Generator> Agent<G> {
     pub fn new(
-        template: AgentChatTemplate,
-        tokenizer: tokenizers::Tokenizer,
+        template: ChatTemplate,
         generator: G,
-        caller: C,
         system_prompt: impl Into<String>,
         max_new_tokens: usize,
     ) -> Self {
         Self {
             template,
-            tokenizer,
             generator,
-            caller,
             system_prompt: system_prompt.into(),
             max_new_tokens,
             max_steps: DEFAULT_MAX_STEPS,
             max_retries: DEFAULT_MAX_RETRIES,
+            max_result_chars: MAX_RESULT_CHARS,
+            abort: AbortFlag::new(),
+            on_text: Box::new(|_| {}),
             messages: Vec::new(),
             tools: Vec::new(),
             step_index: 0,
             pending_calls: Vec::new(),
             consecutive_tool_errors: 0,
+            step_tool_errors: 0,
+            step_oversized_results: 0,
             calls_made_this_turn: Vec::new(),
         }
     }
 
-    pub fn caller(&self) -> &C {
-        &self.caller
+    pub fn generator(&self) -> &G {
+        &self.generator
     }
 
     pub fn set_max_steps(&mut self, max_steps: usize) {
@@ -567,108 +501,288 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         self.max_retries = max_retries;
     }
 
+    pub fn set_max_new_tokens(&mut self, max_new_tokens: usize) {
+        self.max_new_tokens = max_new_tokens;
+    }
+
+    /// A tool result whose formatted content is longer than this (in
+    /// bytes) is fed back to the model as a tool error saying it was too
+    /// large. Default [`MAX_RESULT_CHARS`].
+    pub fn set_max_result_chars(&mut self, max_result_chars: usize) {
+        self.max_result_chars = max_result_chars;
+    }
+
+    /// Receives the model's raw output as it is generated, every step
+    /// (tool calls included, before they are parsed).
+    pub fn set_on_text(&mut self, on_text: impl FnMut(&str) + 'static) {
+        self.on_text = Box::new(on_text);
+    }
+
+    /// A handle that stops the current turn: after `abort()`, the running
+    /// step returns [`StepOutcome::Aborted`]. [`Agent::start`] clears it.
+    pub fn abort_flag(&self) -> AbortFlag {
+        self.abort.clone()
+    }
+
     pub fn reset(&mut self) {
         self.messages.clear();
         self.tools.clear();
         self.step_index = 0;
         self.pending_calls.clear();
         self.consecutive_tool_errors = 0;
+        self.step_tool_errors = 0;
+        self.step_oversized_results = 0;
         self.calls_made_this_turn.clear();
     }
 
-    pub fn start(&mut self, utterance: &str, tools: &[Tool]) -> StepOutcome {
+    /// Begins a turn for `utterance` with `tools`. Each turn is a new
+    /// conversation: the system prompt and this one user message.
+    pub async fn start(&mut self, utterance: &str, tools: &[Tool]) -> StepOutcome {
+        self.abort.reset();
+        self.reset();
         self.tools = tools.to_vec();
         self.messages = vec![
             Message::system(&self.system_prompt),
             Message::user(utterance),
         ];
-        self.step_index = 0;
-        self.pending_calls.clear();
-        self.consecutive_tool_errors = 0;
-        self.calls_made_this_turn.clear();
-
-        self.step_inner()
+        let outcome = self.step_inner().await;
+        if matches!(outcome, StepOutcome::ContextOverflow { .. }) {
+            self.reset();
+        }
+        outcome
     }
 
-    pub fn start_from_mcp(&mut self, utterance: &str, raw_tools: &[Value]) -> StepOutcome {
-        let tools: Vec<Tool> = raw_tools
-            .iter()
-            .filter_map(|t| {
-                Some(Tool::from_mcp(
-                    t.get("name")?.as_str()?,
-                    t.get("description")?.as_str()?,
-                    t.get("inputSchema")?.clone(),
-                ))
-            })
-            .collect();
-        self.start(utterance, &tools)
+    /// [`Agent::start`] with the tools of an MCP `tools/list` array, read
+    /// with [`tools_from_mcp`]; an invalid entry is an `Error` outcome.
+    pub async fn start_from_mcp(&mut self, utterance: &str, raw_tools: &[Value]) -> StepOutcome {
+        match tools_from_mcp(raw_tools) {
+            Ok(tools) => self.start(utterance, &tools).await,
+            Err(e) => StepOutcome::Error {
+                message: format!("reading tools: {e:#}"),
+                step: None,
+            },
+        }
     }
 
-    /// Continue the current turn with the results of the tool calls from
-    /// the most recent `NeedTools` outcome, keyed by `call_id`.
-    pub fn provide_tool_results(&mut self, results: Vec<(String, Value)>) -> StepOutcome {
-        for (call_id, result) in results {
-            if let Some(pending) = self.pending_calls.iter().find(|c| c.call_id == call_id) {
-                if let Some(error_message) = tool_error_message(&result) {
-                    self.consecutive_tool_errors += 1;
-                    if self.consecutive_tool_errors > MAX_CONSECUTIVE_TOOL_ERRORS {
-                        self.pending_calls.clear();
-                        return StepOutcome::Error {
-                            message: format!(
-                                "{} consecutive tool errors (giving up after {}): {error_message}",
-                                self.consecutive_tool_errors, MAX_CONSECUTIVE_TOOL_ERRORS
-                            ),
-                            step: None,
-                        };
-                    }
-                    self.messages
-                        .push(format_tool_error(&pending.name, &error_message));
+    /// Continues the turn with the results of the calls from the most
+    /// recent `NeedTools` outcome, one per call, keyed by `call_id`. An
+    /// unknown, duplicate or missing id is an `Error` outcome that leaves
+    /// the agent as it was.
+    pub async fn provide_tool_results(&mut self, results: Vec<(String, Value)>) -> StepOutcome {
+        let ordered = match self.results_in_call_order(results) {
+            Ok(ordered) => ordered,
+            Err(message) => {
+                return StepOutcome::Error {
+                    message,
+                    step: None,
+                }
+            }
+        };
+        let saved = self.save_turn();
+
+        let pending = std::mem::take(&mut self.pending_calls);
+        self.step_tool_errors = 0;
+        self.step_oversized_results = 0;
+        for (call, result) in pending.iter().zip(ordered) {
+            if let Some(error_message) = tool_error_message(&result) {
+                self.consecutive_tool_errors += 1;
+                self.step_tool_errors += 1;
+                if self.consecutive_tool_errors > MAX_CONSECUTIVE_TOOL_ERRORS {
+                    return StepOutcome::Error {
+                        message: format!(
+                            "{} consecutive tool errors (giving up after {}): {error_message}",
+                            self.consecutive_tool_errors, MAX_CONSECUTIVE_TOOL_ERRORS
+                        ),
+                        step: None,
+                    };
+                }
+                // A failed call may be retried as is.
+                let failed = ToolCall {
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                };
+                self.calls_made_this_turn.retain(|c| *c != failed);
+                self.messages
+                    .push(format_tool_error(&call.name, &error_message));
+            } else {
+                self.consecutive_tool_errors = 0;
+                let message = format_tool_result(&call.name, &result);
+                if message.content.len() > self.max_result_chars {
+                    self.step_oversized_results += 1;
+                    self.messages.push(format_tool_error(
+                        &call.name,
+                        &format!(
+                            "result too large: {} characters, the limit is {}",
+                            message.content.len(),
+                            self.max_result_chars
+                        ),
+                    ));
                 } else {
-                    self.consecutive_tool_errors = 0;
-                    self.messages
-                        .push(format_tool_result(&pending.name, &result));
+                    self.messages.push(message);
                 }
             }
         }
-        self.pending_calls.clear();
-        self.step_inner()
+
+        let outcome = self.step_inner().await;
+        if matches!(outcome, StepOutcome::ContextOverflow { .. }) {
+            self.restore_turn(saved);
+        }
+        outcome
     }
 
-    fn generate_attempt(&mut self) -> std::result::Result<AttemptOutput, String> {
-        let rendered = self
-            .template
-            .render(&self.messages, &self.tools, true)
-            .map_err(|e| format!("rendering prompt: {e:#}"))?;
-        let encoding = self
-            .tokenizer
-            .encode(rendered, false)
-            .map_err(|e| format!("tokenizer encode failed: {e}"))?;
-        let prompt_tokens = encoding.get_ids().to_vec();
-        let out_ids = self
-            .generator
-            .generate(&prompt_tokens, self.max_new_tokens)
-            .map_err(|e| format!("generation failed: {e:#}"))?;
+    /// `results` in the order of the pending calls, or why they do not
+    /// match them one to one.
+    fn results_in_call_order(
+        &self,
+        mut results: Vec<(String, Value)>,
+    ) -> std::result::Result<Vec<Value>, String> {
+        let mut ordered = Vec::with_capacity(self.pending_calls.len());
+        for call in &self.pending_calls {
+            let index = results
+                .iter()
+                .position(|(id, _)| *id == call.call_id)
+                .ok_or_else(|| {
+                    format!("no result for tool call `{}` ({})", call.call_id, call.name)
+                })?;
+            ordered.push(results.swap_remove(index).1);
+        }
+        if let Some((id, _)) = results.first() {
+            return Err(format!(
+                "no pending tool call has id `{id}`, or it has more than one result"
+            ));
+        }
+        Ok(ordered)
+    }
+
+    fn save_turn(&self) -> TurnState {
+        TurnState {
+            messages_len: self.messages.len(),
+            step_index: self.step_index,
+            pending_calls: self.pending_calls.clone(),
+            consecutive_tool_errors: self.consecutive_tool_errors,
+            step_tool_errors: self.step_tool_errors,
+            step_oversized_results: self.step_oversized_results,
+            calls_made_this_turn: self.calls_made_this_turn.clone(),
+        }
+    }
+
+    fn restore_turn(&mut self, saved: TurnState) {
+        self.messages.truncate(saved.messages_len);
+        self.step_index = saved.step_index;
+        self.pending_calls = saved.pending_calls;
+        self.consecutive_tool_errors = saved.consecutive_tool_errors;
+        self.step_tool_errors = saved.step_tool_errors;
+        self.step_oversized_results = saved.step_oversized_results;
+        self.calls_made_this_turn = saved.calls_made_this_turn;
+    }
+
+    /// Renders the conversation plus `notes` (as `user` messages that are
+    /// not kept in the history), generates and parses one reply. `Err` is
+    /// the outcome to return as is (render or engine failure, overflow,
+    /// abort).
+    async fn generate_attempt(
+        &mut self,
+        notes: &[String],
+    ) -> std::result::Result<AttemptOutput, Box<StepOutcome>> {
+        let rendered = if notes.is_empty() {
+            render_prompt(&self.template, &self.messages, &self.tools)
+        } else {
+            let mut messages = self.messages.clone();
+            messages.extend(notes.iter().map(Message::user));
+            render_prompt(&self.template, &messages, &self.tools)
+        };
+        let prompt = rendered.map_err(|e| StepOutcome::Error {
+            message: format!("rendering prompt: {e:#}"),
+            step: None,
+        })?;
         let generated_text = self
-            .tokenizer
-            .decode(&out_ids, true)
-            .map_err(|e| format!("tokenizer decode failed: {e}"))?;
+            .generator
+            .generate(
+                &prompt,
+                self.max_new_tokens,
+                &mut *self.on_text,
+                &self.abort,
+            )
+            .await
+            .map_err(|e| {
+                Box::new(match e {
+                    GenerateError::ContextOverflow { needed, available } => {
+                        StepOutcome::ContextOverflow { needed, available }
+                    }
+                    GenerateError::Aborted => StepOutcome::Aborted,
+                    GenerateError::Other(e) => StepOutcome::Error {
+                        message: format!("generation failed: {e:#}"),
+                        step: None,
+                    },
+                })
+            })?;
         let parsed = parse_output(&generated_text);
         Ok(AttemptOutput {
-            prompt_tokens,
+            prompt,
             generated_text,
             parsed,
         })
     }
 
+    /// `parsed` if it can be accepted; otherwise why not, with a short
+    /// reason for the model and the full one for the caller.
+    fn check(
+        &self,
+        parsed: std::result::Result<ParsedOutput, String>,
+    ) -> std::result::Result<ParsedOutput, (Rejection, String, String)> {
+        let calls = match parsed {
+            Err(e) => {
+                return Err((
+                    Rejection::Invalid,
+                    "Your last reply was not a valid tool call.".to_string(),
+                    e,
+                ))
+            }
+            Ok(ParsedOutput::ToolCalls(calls)) => calls,
+            Ok(text) => return Ok(text),
+        };
+        if calls.is_empty() {
+            return Err((
+                Rejection::Empty,
+                "Your last reply had no tool call in it.".to_string(),
+                "empty tool call list".to_string(),
+            ));
+        }
+        if let Some(unknown) = calls
+            .iter()
+            .find(|c| !self.tools.iter().any(|t| t.function.name == c.name))
+        {
+            return Err((
+                Rejection::Invalid,
+                format!("`{}` is not one of the tools.", unknown.name),
+                format!("call to unknown tool `{}`", unknown.name),
+            ));
+        }
+        if let Some(repeat) = calls.iter().find(|c| self.calls_made_this_turn.contains(c)) {
+            return Err((
+                Rejection::Repeat,
+                format!(
+                    "`{}` was already called with these arguments; use its result.",
+                    repeat.name
+                ),
+                format!("repeated call {}({})", repeat.name, repeat.arguments),
+            ));
+        }
+        Ok(ParsedOutput::ToolCalls(calls))
+    }
+
     /// One render -> generate -> parse round using `self.messages`/`self.tools`.
     ///
-    /// Malformed-output retry policy: an empty tool-call array, unparsable
-    /// output, or a call naming a tool outside `self.tools` does not get
-    /// appended to history; the agent regenerates, nudging with
-    /// [`RETRY_NOTE`] once `self.max_retries` is exhausted. A call
-    /// identical (same name+args) to one already made earlier this turn is
-    /// never re-executed (the repeated-call loop guard).
-    fn step_inner(&mut self) -> StepOutcome {
+    /// Retry policy: an unparsable reply, an empty tool-call block, a call
+    /// to a tool outside `self.tools`, or a call identical (same name and
+    /// arguments) to one already made this turn whose result was not an
+    /// error is not accepted. The agent regenerates up to
+    /// `self.max_retries` times, each time with a `user` note saying what
+    /// was wrong; the notes are part of that step's prompts only, never of
+    /// the history. When the retries are spent on repeated or empty calls,
+    /// the model is asked once more for a plain-text answer; otherwise the
+    /// step is an error carrying the last reason.
+    async fn step_inner(&mut self) -> StepOutcome {
         if self.step_index >= self.max_steps {
             return StepOutcome::Error {
                 message: format!(
@@ -680,145 +794,139 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         }
         self.step_index += 1;
 
-        let mut retries = 0usize;
+        let mut notes: Vec<String> = Vec::new();
         let mut repeat_guard = false;
         loop {
-            let attempt = match self.generate_attempt() {
+            let attempt = match self.generate_attempt(&notes).await {
                 Ok(a) => a,
-                Err(message) => {
-                    return StepOutcome::Error {
-                        message,
-                        step: None,
-                    }
-                }
+                Err(outcome) => return *outcome,
             };
-
-            let empty_calls =
-                matches!(&attempt.parsed, Ok(ParsedOutput::ToolCalls(calls)) if calls.is_empty());
-            let invalid = match &attempt.parsed {
-                Err(_) => true,
-                Ok(ParsedOutput::ToolCalls(calls)) => {
-                    calls.is_empty()
-                        || calls
-                            .iter()
-                            .any(|c| !self.tools.iter().any(|t| t.function.name == c.name))
-                }
-                Ok(ParsedOutput::Text(_)) => false,
-            };
-
-            let is_repeat = !invalid
-                && matches!(&attempt.parsed, Ok(ParsedOutput::ToolCalls(calls)) if calls.iter().any(|c| self.calls_made_this_turn.contains(c)));
-            if is_repeat {
-                repeat_guard = true;
-            }
-
-            if invalid || is_repeat {
-                if retries < self.max_retries {
-                    retries += 1;
-                    self.messages.push(Message::user(RETRY_NOTE));
-                    continue;
-                }
-                if is_repeat || empty_calls {
-                    return self.force_final_answer(repeat_guard);
-                }
-                return StepOutcome::Error {
-                    message: "model produced no valid call".to_string(),
-                    step: None,
-                };
-            }
 
             let AttemptOutput {
-                prompt_tokens,
+                prompt,
                 generated_text,
                 parsed,
             } = attempt;
-            let parsed = parsed.expect("checked valid above");
-            let tool_errors = self.consecutive_tool_errors;
-
-            return match parsed {
-                ParsedOutput::ToolCalls(calls) => {
-                    let pending = pending_calls_from(&calls);
-                    let entries = tool_call_entries(&pending);
-                    self.messages.push(Message::assistant_tool_calls(entries));
-                    self.pending_calls = pending.clone();
-                    self.calls_made_this_turn.extend(calls.iter().cloned());
-
+            match self.check(parsed) {
+                Ok(parsed) => {
                     let step = Step {
-                        prompt_tokens,
+                        prompt,
                         generated_text,
-                        parsed: ParsedOutput::ToolCalls(calls),
-                        retries,
-                        tool_errors,
+                        parsed,
+                        retries: notes.len(),
+                        tool_errors: self.step_tool_errors,
+                        oversized_results: self.step_oversized_results,
                         repeat_guard,
                         forced_text_answer: false,
                     };
-                    StepOutcome::NeedTools {
-                        calls: pending,
-                        step,
+                    return self.accept(step);
+                }
+                Err((rejection, note, detail)) => {
+                    if matches!(rejection, Rejection::Repeat) {
+                        repeat_guard = true;
                     }
-                }
-                ParsedOutput::Text(text) => {
-                    self.messages.push(Message::assistant_text(&text));
-                    let step = Step {
-                        prompt_tokens,
-                        generated_text,
-                        parsed: ParsedOutput::Text(text.clone()),
-                        retries,
-                        tool_errors,
-                        repeat_guard,
-                        forced_text_answer: false,
+                    if notes.len() < self.max_retries {
+                        notes.push(format!("{note} {RETRY_NOTE}"));
+                        continue;
+                    }
+                    if matches!(rejection, Rejection::Repeat | Rejection::Empty) {
+                        return self.force_final_answer(notes, repeat_guard).await;
+                    }
+                    return StepOutcome::Error {
+                        message: format!(
+                            "model produced no valid call after {} retries: {detail}",
+                            notes.len()
+                        ),
+                        step: None,
                     };
-                    StepOutcome::Final { text, step }
                 }
-            };
+            }
         }
     }
 
-    /// Last resort when the retry budget is exhausted on a repeated or
-    /// empty tool call: nudge once more and accept whatever text comes
-    /// back (falling back to the raw output if the model still emits a
-    /// tool call, rather than looping forever).
-    fn force_final_answer(&mut self, repeat_guard: bool) -> StepOutcome {
-        self.messages.push(Message::user(
-            "Give your final answer as plain text now, with no tool call.",
-        ));
-        let attempt = match self.generate_attempt() {
+    fn accept(&mut self, step: Step) -> StepOutcome {
+        match &step.parsed {
+            ParsedOutput::ToolCalls(calls) => {
+                let pending = pending_calls_from(calls);
+                self.messages
+                    .push(Message::assistant_tool_calls("", chat_tool_calls(&pending)));
+                self.pending_calls = pending.clone();
+                self.calls_made_this_turn.extend(calls.iter().cloned());
+                StepOutcome::NeedTools {
+                    calls: pending,
+                    step,
+                }
+            }
+            ParsedOutput::Text(text) => {
+                let text = text.clone();
+                self.messages.push(Message::assistant(&text));
+                StepOutcome::Final { text, step }
+            }
+        }
+    }
+
+    /// Last resort when the retries are spent on repeated or empty tool
+    /// calls: one more generation, in the same step, with
+    /// [`FINAL_ANSWER_NOTE`] added. A text reply is the final answer; a
+    /// reply that still calls a tool is an error (its markup is never
+    /// returned as the answer).
+    async fn force_final_answer(
+        &mut self,
+        mut notes: Vec<String>,
+        repeat_guard: bool,
+    ) -> StepOutcome {
+        let retries = notes.len();
+        notes.push(FINAL_ANSWER_NOTE.to_string());
+        let attempt = match self.generate_attempt(&notes).await {
             Ok(a) => a,
-            Err(message) => {
+            Err(outcome) => return *outcome,
+        };
+        let AttemptOutput {
+            prompt,
+            generated_text,
+            parsed,
+        } = attempt;
+        let parsed = match parsed {
+            Ok(parsed) => parsed,
+            Err(e) => {
                 return StepOutcome::Error {
-                    message,
+                    message: format!("asked for a plain-text answer, the model replied: {e}"),
                     step: None,
                 }
             }
         };
-        let AttemptOutput {
-            prompt_tokens,
+        let is_text = matches!(parsed, ParsedOutput::Text(_));
+        let step = Step {
+            prompt,
             generated_text,
             parsed,
-        } = attempt;
-        let text = match parsed {
-            Ok(ParsedOutput::Text(t)) => t,
-            _ => generated_text.clone(),
-        };
-        self.messages.push(Message::assistant_text(&text));
-        let step = Step {
-            prompt_tokens,
-            generated_text,
-            parsed: ParsedOutput::Text(text.clone()),
-            retries: self.max_retries,
-            tool_errors: self.consecutive_tool_errors,
+            retries,
+            tool_errors: self.step_tool_errors,
+            oversized_results: self.step_oversized_results,
             repeat_guard,
             forced_text_answer: true,
         };
-        StepOutcome::Final { text, step }
+        if is_text {
+            self.accept(step)
+        } else {
+            StepOutcome::Error {
+                message: "asked for a plain-text answer, the model called a tool again".to_string(),
+                step: Some(step),
+            }
+        }
     }
 
-    /// Synchronous convenience for native callers (tests, eval, a CLI)
-    /// with a synchronous `ToolCaller`: runs the whole turn to completion.
-    pub fn run(&mut self, utterance: &str, tools: &[Tool], max_steps: usize) -> Result<Transcript> {
-        self.max_steps = max_steps;
-        let mut steps = Vec::with_capacity(max_steps);
-        let mut outcome = self.start(utterance, tools);
+    /// Runs a whole turn with a synchronous `caller` (tests, eval, a CLI),
+    /// up to the agent's `max_steps`. A caller error is fed to the model
+    /// as a tool error, like an MCP error result.
+    pub async fn run<C: ToolCaller>(
+        &mut self,
+        utterance: &str,
+        tools: &[Tool],
+        caller: &mut C,
+    ) -> Result<Transcript> {
+        let mut steps = Vec::new();
+        let mut outcome = self.start(utterance, tools).await;
 
         loop {
             match outcome {
@@ -831,22 +939,28 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
                 }
                 StepOutcome::NeedTools { calls, step } => {
                     steps.push(step);
-                    let mut results = Vec::with_capacity(calls.len());
-                    for call in &calls {
-                        let result = self.caller.call(&call.name, &call.arguments)?;
-                        results.push((call.call_id.clone(), result));
-                    }
-                    outcome = self.provide_tool_results(results);
+                    let results = calls
+                        .iter()
+                        .map(|call| (call.call_id.clone(), call_or_error(caller, call)))
+                        .collect();
+                    outcome = self.provide_tool_results(results).await;
                 }
-                StepOutcome::Error { message, step } => {
-                    if let Some(step) = step {
-                        steps.push(step);
-                    }
-                    bail!("{message}");
+                StepOutcome::ContextOverflow { needed, available } => {
+                    bail!("context overflow: needed {needed} tokens, {available} available");
                 }
+                StepOutcome::Aborted => bail!("aborted"),
+                StepOutcome::Error { message, .. } => bail!("{message}"),
             }
         }
     }
+}
+
+/// `caller`'s result for `call`, or its error as an `{"error": ...}`
+/// result.
+pub fn call_or_error<C: ToolCaller>(caller: &mut C, call: &PendingToolCall) -> Value {
+    caller
+        .call(&call.name, &call.arguments)
+        .unwrap_or_else(|e| serde_json::json!({ "error": format!("{e:#}") }))
 }
 
 fn pending_calls_from(calls: &[ToolCall]) -> Vec<PendingToolCall> {
@@ -861,22 +975,17 @@ fn pending_calls_from(calls: &[ToolCall]) -> Vec<PendingToolCall> {
         .collect()
 }
 
-fn tool_call_entries(pending: &[PendingToolCall]) -> Vec<ToolCallEntry> {
+fn chat_tool_calls(pending: &[PendingToolCall]) -> Vec<lean_chat::ToolCall> {
     pending
         .iter()
-        .map(|c| ToolCallEntry {
-            kind: "function".to_string(),
-            function: ToolCallFunction {
-                name: c.name.clone(),
-                arguments: c.arguments.clone(),
-            },
-        })
+        .map(|c| lean_chat::ToolCall::new(c.name.clone(), c.arguments.clone()))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::FakeGenerator;
 
     /// Qwen2.5-Instruct's tools-branch template, copied from the model's
     /// own `tokenizer_config.json`.
@@ -893,9 +1002,9 @@ mod tests {
 
     #[test]
     fn renders_tools_preamble_and_single_user_turn() {
-        let tmpl = AgentChatTemplate::new(QWEN25_TOOLS_TEMPLATE).unwrap();
+        let tmpl = ChatTemplate::new(QWEN25_TOOLS_TEMPLATE);
         let messages = vec![Message::user("What's the weather in Paris?")];
-        let out = tmpl.render(&messages, &[weather_tool()], true).unwrap();
+        let out = render_prompt(&tmpl, &messages, &[weather_tool()]).unwrap();
         assert!(out.starts_with("<|im_start|>system\n"));
         assert!(out.contains(
             "<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\""
@@ -906,22 +1015,22 @@ mod tests {
 
     #[test]
     fn renders_multiturn_with_tool_call_and_result() {
-        let tmpl = AgentChatTemplate::new(QWEN25_TOOLS_TEMPLATE).unwrap();
+        let tmpl = ChatTemplate::new(QWEN25_TOOLS_TEMPLATE);
         let messages = vec![
             Message::user("What's the weather in Paris?"),
-            Message::assistant_tool_calls(vec![ToolCallEntry {
-                kind: "function".into(),
-                function: ToolCallFunction {
-                    name: "get_weather".into(),
-                    arguments: serde_json::json!({"city": "Paris"}),
-                },
-            }]),
+            Message::assistant_tool_calls(
+                "",
+                vec![lean_chat::ToolCall::new(
+                    "get_weather",
+                    serde_json::json!({"city": "Paris"}),
+                )],
+            ),
             format_tool_result(
                 "get_weather",
                 &serde_json::json!({"temp_c": 14, "condition": "cloudy"}),
             ),
         ];
-        let out = tmpl.render(&messages, &[weather_tool()], true).unwrap();
+        let out = render_prompt(&tmpl, &messages, &[weather_tool()]).unwrap();
         assert!(out.contains("<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>"));
         assert!(out.contains(
             "<tool_response>\n{\"temp_c\": 14, \"condition\": \"cloudy\"}\n</tool_response>"
@@ -974,17 +1083,70 @@ mod tests {
     }
 
     #[test]
+    fn call_without_arguments_has_empty_arguments() {
+        let empty = serde_json::json!({});
+        for raw in [
+            "<tool_call>\n{\"name\": \"a\"}\n</tool_call>",
+            "<tool_call>\n{\"name\": \"a\", \"arguments\": null}\n</tool_call>",
+            "<tool_call>\n{\"name\": \"a\", \"arguments\": \"{}\"}\n</tool_call>",
+        ] {
+            assert_eq!(
+                parse_output(raw).unwrap(),
+                ParsedOutput::ToolCalls(vec![ToolCall {
+                    name: "a".into(),
+                    arguments: empty.clone()
+                }]),
+                "{raw}"
+            );
+        }
+        assert!(
+            parse_output("<tool_call>\n{\"name\": \"a\", \"arguments\": 3}\n</tool_call>").is_err()
+        );
+    }
+
+    #[test]
+    fn mcp_tools_without_description_or_schema_are_accepted() {
+        let tools = tools_from_mcp(&[
+            serde_json::json!({"name": "ping"}),
+            serde_json::json!({"name": "echo", "description": null, "inputSchema": {"type": "object"}}),
+        ])
+        .unwrap();
+        assert_eq!(tools[0].function.name, "ping");
+        assert_eq!(tools[0].function.description, "");
+        assert_eq!(
+            tools[0].function.parameters,
+            serde_json::json!({"type": "object", "properties": {}})
+        );
+        assert_eq!(tools[1].function.description, "");
+        assert!(tools_from_mcp(&[serde_json::json!({"description": "no name"})]).is_err());
+        assert!(
+            tools_from_mcp(&[serde_json::json!({"name": "x", "inputSchema": "nope"})]).is_err()
+        );
+    }
+
+    #[test]
+    fn null_or_false_error_field_is_not_an_error() {
+        assert_eq!(
+            tool_error_message(&serde_json::json!({"error": null, "ok": 1})),
+            None
+        );
+        assert_eq!(
+            tool_error_message(&serde_json::json!({"error": false})),
+            None
+        );
+        assert_eq!(
+            tool_error_message(&serde_json::json!({"error": "no such group"})),
+            Some("no such group".to_string())
+        );
+    }
+
+    #[test]
     fn format_tool_result_compacts_embedded_json_string() {
         let msg = format_tool_result(
             "get_weather",
             &serde_json::json!({"body": "{\n  \"temp_c\": 14\n}"}),
         );
-        assert_eq!(
-            msg.content,
-            Some(Value::String(
-                "{\"body\": \"{\\\"temp_c\\\": 14}\"}".to_string()
-            ))
-        );
+        assert_eq!(msg.content, "{\"body\": \"{\\\"temp_c\\\": 14}\"}");
     }
 
     #[test]
@@ -1003,48 +1165,345 @@ mod tests {
         }
     }
 
-    fn id(tokenizer: &tokenizers::Tokenizer, s: &str) -> Vec<u32> {
-        tokenizer.encode(s, false).unwrap().get_ids().to_vec()
+    struct FailingCaller;
+    impl ToolCaller for FailingCaller {
+        fn call(&mut self, name: &str, _args: &Value) -> Result<Value> {
+            bail!("{name} is offline")
+        }
     }
 
-    /// End-to-end step-wise loop against a scripted `FixtureGenerator`: the
-    /// model calls a tool, gets a result, then answers in text.
-    #[test]
-    fn agent_loop_calls_tool_then_answers() {
-        // No pre-tokenizer: each whole turn is one atomic vocab entry, so
-        // encode/decode round-trips it exactly. This test only exercises
-        // the loop's control flow, not real subword tokenization.
-        let tool_call_text = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>";
-        let answer_text = "It is cloudy.";
-        let vocab = [(tool_call_text, 0u32), (answer_text, 1), ("<unk>", 2)];
-        let model = tokenizers::models::wordlevel::WordLevel::builder()
-            .vocab(vocab.iter().map(|(s, i)| (s.to_string(), *i)).collect())
-            .unk_token("<unk>".into())
-            .build()
-            .unwrap();
-        let tokenizer = tokenizers::Tokenizer::new(model);
+    const PARIS_CALL: &str = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>";
+    const LYON_CALL: &str = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Lyon\"}}\n</tool_call>";
 
-        let tool_call_ids = id(&tokenizer, tool_call_text);
-        let answer_ids = id(&tokenizer, answer_text);
-
-        let generator = FixtureGenerator::new(vec![tool_call_ids, answer_ids]);
-        let template = AgentChatTemplate::new(QWEN25_TOOLS_TEMPLATE).unwrap();
-        let mut agent = Agent::new(
-            template,
-            tokenizer,
+    fn agent_with(generator: FakeGenerator) -> Agent<FakeGenerator> {
+        Agent::new(
+            ChatTemplate::new(QWEN25_TOOLS_TEMPLATE),
             generator,
-            EchoCaller,
             "You are a helpful assistant.",
             64,
-        );
+        )
+    }
 
-        let transcript = agent
-            .run("What's the weather in Paris?", &[weather_tool()], 4)
-            .unwrap();
+    fn start(agent: &mut Agent<FakeGenerator>) -> StepOutcome {
+        pollster::block_on(agent.start("What's the weather in Paris?", &[weather_tool()]))
+    }
+
+    fn provide(agent: &mut Agent<FakeGenerator>, result: Value) -> StepOutcome {
+        pollster::block_on(agent.provide_tool_results(vec![("call_0".to_string(), result)]))
+    }
+
+    fn sunny() -> Value {
+        serde_json::json!({"temp_c": 21, "condition": "sunny"})
+    }
+
+    /// End-to-end step-wise loop: the model calls a tool, gets a result,
+    /// then answers in text.
+    #[test]
+    fn agent_loop_calls_tool_then_answers() {
+        let answer_text = "It is cloudy.";
+        let mut agent = agent_with(FakeGenerator::script(&[PARIS_CALL, answer_text]));
+        agent.set_max_steps(4);
+
+        let transcript = pollster::block_on(agent.run(
+            "What's the weather in Paris?",
+            &[weather_tool()],
+            &mut EchoCaller,
+        ))
+        .unwrap();
         assert_eq!(transcript.steps.len(), 2);
         assert!(
             matches!(&transcript.steps[0].parsed, ParsedOutput::ToolCalls(calls) if calls.len() == 1 && calls[0].name == "get_weather")
         );
         assert!(matches!(&transcript.steps[1].parsed, ParsedOutput::Text(_)));
+        assert!(transcript.steps[1].prompt.contains(
+            "<tool_response>\n{\"called\": \"get_weather\", \"with\": {\"city\": \"Paris\"}}\n</tool_response>"
+        ));
+        assert_eq!(transcript.final_text, answer_text);
+    }
+
+    #[test]
+    fn run_feeds_a_caller_error_to_the_model() {
+        let mut agent = agent_with(FakeGenerator::script(&[PARIS_CALL, "It is offline."]));
+        let transcript = pollster::block_on(agent.run(
+            "What's the weather in Paris?",
+            &[weather_tool()],
+            &mut FailingCaller,
+        ))
+        .unwrap();
+        assert_eq!(transcript.steps[1].tool_errors, 1);
+        assert!(transcript.steps[1].prompt.contains(
+            "<tool_response>\n{\"error\": \"get_weather is offline\"}\n</tool_response>"
+        ));
+    }
+
+    #[test]
+    fn streams_text_and_abort_stops_the_turn() {
+        let mut agent = agent_with(FakeGenerator::script(&["Hello."]));
+        let streamed = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let sink = streamed.clone();
+        agent.set_on_text(move |t| sink.borrow_mut().push_str(t));
+        let first = pollster::block_on(agent.start("hi", &[weather_tool()]));
+        assert!(matches!(first, StepOutcome::Final { .. }), "{first:?}");
+        assert_eq!(*streamed.borrow(), "Hello.");
+
+        agent.abort_flag().abort();
+        let outcome = pollster::block_on(agent.provide_tool_results(Vec::new()));
+        assert!(matches!(outcome, StepOutcome::Aborted), "{outcome:?}");
+    }
+
+    #[test]
+    fn abort_during_a_generation_stops_the_step() {
+        let mut agent = agent_with(FakeGenerator::script(&[PARIS_CALL]));
+        let flag = agent.abort_flag();
+        agent.set_on_text(move |_| flag.abort());
+        assert!(matches!(start(&mut agent), StepOutcome::Aborted));
+    }
+
+    #[test]
+    fn retry_notes_are_not_kept_in_history() {
+        let generator = FakeGenerator::script(&[
+            "<tool_call>\nnot json\n</tool_call>",
+            PARIS_CALL,
+            "It is sunny.",
+        ]);
+        let prompts = generator.prompts();
+        let mut agent = agent_with(generator);
+
+        let outcome = start(&mut agent);
+        let StepOutcome::NeedTools { step, .. } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(step.retries, 1);
+        assert!(prompts.borrow()[1].contains("Your last reply was not a valid tool call."));
+
+        let outcome = provide(&mut agent, sunny());
+        assert!(matches!(outcome, StepOutcome::Final { .. }), "{outcome:?}");
+        let prompts = prompts.borrow();
+        assert!(!prompts[2].contains(RETRY_NOTE));
+        // The next step's prompt extends the first one, so an engine can
+        // reuse its KV cache for all of it.
+        assert!(prompts[2].starts_with(&prompts[0]));
+    }
+
+    #[test]
+    fn spent_retries_report_the_last_reason() {
+        let mut agent = agent_with(FakeGenerator::script(&[
+            "<tool_call>\nnot json\n</tool_call>",
+            "<tool_call>\n{\"name\": \"get_weather\"\n</tool_call>",
+            "<tool_call>\n{\"name\": \"nope\", \"arguments\": {}}\n</tool_call>",
+        ]));
+        let outcome = start(&mut agent);
+        let StepOutcome::Error { message, .. } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(message.contains("after 2 retries"), "{message}");
+        assert!(message.contains("unknown tool `nope`"), "{message}");
+    }
+
+    #[test]
+    fn repeated_call_ends_in_a_forced_text_answer() {
+        let generator = FakeGenerator::script(&[
+            PARIS_CALL,
+            PARIS_CALL,
+            PARIS_CALL,
+            PARIS_CALL,
+            "It is sunny.",
+        ]);
+        let prompts = generator.prompts();
+        let mut agent = agent_with(generator);
+        assert!(matches!(start(&mut agent), StepOutcome::NeedTools { .. }));
+
+        let outcome = provide(&mut agent, sunny());
+        let StepOutcome::Final { text, step } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(text, "It is sunny.");
+        assert!(step.forced_text_answer && step.repeat_guard);
+        assert_eq!(step.retries, 2);
+        assert!(prompts.borrow()[4].contains(FINAL_ANSWER_NOTE));
+
+        // The note is not kept: the history ends with the answer.
+        let next = pollster::block_on(agent.provide_tool_results(Vec::new()));
+        assert!(matches!(next, StepOutcome::Error { .. }));
+        let last = prompts.borrow().last().cloned().unwrap();
+        assert!(!last.contains(FINAL_ANSWER_NOTE));
+    }
+
+    #[test]
+    fn forced_answer_that_calls_a_tool_is_an_error_not_markup() {
+        let mut agent = agent_with(FakeGenerator::script(&[PARIS_CALL; 5]));
+        assert!(matches!(start(&mut agent), StepOutcome::NeedTools { .. }));
+        let outcome = provide(&mut agent, sunny());
+        let StepOutcome::Error { message, step } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(message.contains("called a tool again"), "{message}");
+        assert!(step.is_some_and(|s| s.forced_text_answer));
+    }
+
+    #[test]
+    fn a_failed_call_may_be_retried_as_is() {
+        let mut agent = agent_with(FakeGenerator::script(&[PARIS_CALL, PARIS_CALL]));
+        assert!(matches!(start(&mut agent), StepOutcome::NeedTools { .. }));
+        let outcome = provide(&mut agent, serde_json::json!({"error": "timeout"}));
+        let StepOutcome::NeedTools { step, .. } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(!step.repeat_guard);
+        assert_eq!(step.retries, 0);
+        assert_eq!(step.tool_errors, 1);
+    }
+
+    #[test]
+    fn tool_errors_count_per_step() {
+        let mut agent = agent_with(FakeGenerator::script(&[
+            PARIS_CALL,
+            LYON_CALL,
+            "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Nice\"}}\n</tool_call>",
+        ]));
+        assert!(matches!(start(&mut agent), StepOutcome::NeedTools { .. }));
+        let error = serde_json::json!({"error": "timeout"});
+        let StepOutcome::NeedTools { step, .. } = provide(&mut agent, error.clone()) else {
+            panic!()
+        };
+        assert_eq!(step.tool_errors, 1);
+        let StepOutcome::NeedTools { step, .. } = provide(&mut agent, error) else {
+            panic!()
+        };
+        assert_eq!(step.tool_errors, 1);
+    }
+
+    #[test]
+    fn too_many_consecutive_tool_errors_end_the_turn() {
+        let mut agent = agent_with(FakeGenerator::script(&[PARIS_CALL; 4]));
+        assert!(matches!(start(&mut agent), StepOutcome::NeedTools { .. }));
+        let error =
+            serde_json::json!({"isError": true, "content": [{"type": "text", "text": "bad city"}]});
+        for _ in 0..MAX_CONSECUTIVE_TOOL_ERRORS {
+            let outcome = provide(&mut agent, error.clone());
+            assert!(
+                matches!(outcome, StepOutcome::NeedTools { .. }),
+                "{outcome:?}"
+            );
+        }
+        let outcome = provide(&mut agent, error);
+        let StepOutcome::Error { message, .. } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(message.contains("4 consecutive tool errors"), "{message}");
+    }
+
+    #[test]
+    fn max_steps_ends_the_turn() {
+        let mut agent = agent_with(FakeGenerator::script(&[PARIS_CALL]));
+        agent.set_max_steps(1);
+        assert!(matches!(start(&mut agent), StepOutcome::NeedTools { .. }));
+        let outcome = provide(&mut agent, sunny());
+        assert!(
+            matches!(&outcome, StepOutcome::Error { message, .. } if message.contains("max_steps")),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn generator_failure_is_an_error_outcome() {
+        let mut agent = agent_with(FakeGenerator::script(&[]));
+        let outcome = start(&mut agent);
+        assert!(
+            matches!(&outcome, StepOutcome::Error { message, .. } if message.contains("generation failed")),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn context_overflow_mid_turn_is_recoverable() {
+        const LIMIT: usize = 4000;
+        let mut replies = vec![PARIS_CALL, "It is sunny."].into_iter();
+        let generator = FakeGenerator::new(move |prompt| {
+            if prompt.len() > LIMIT {
+                return Err(GenerateError::ContextOverflow {
+                    needed: prompt.len(),
+                    available: LIMIT,
+                });
+            }
+            Ok(replies.next().unwrap().to_string())
+        });
+        let prompts = generator.prompts();
+        let mut agent = agent_with(generator);
+        assert!(matches!(start(&mut agent), StepOutcome::NeedTools { .. }));
+
+        let big = serde_json::json!({"report": "x".repeat(LIMIT)});
+        let outcome = provide(&mut agent, big);
+        assert!(
+            matches!(
+                outcome,
+                StepOutcome::ContextOverflow {
+                    available: LIMIT,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+
+        // The same call takes a smaller result.
+        let outcome = provide(&mut agent, sunny());
+        let StepOutcome::Final { text, step } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(text, "It is sunny.");
+        assert!(!step.prompt.contains("xxxx"));
+        assert_eq!(prompts.borrow().len(), 3);
+    }
+
+    #[test]
+    fn oversized_result_is_fed_back_as_an_error() {
+        let generator = FakeGenerator::script(&[PARIS_CALL, "It is too much."]);
+        let mut agent = agent_with(generator);
+        assert!(matches!(start(&mut agent), StepOutcome::NeedTools { .. }));
+        let big = serde_json::json!({"report": "x".repeat(MAX_RESULT_CHARS)});
+        let StepOutcome::Final { step, .. } = provide(&mut agent, big) else {
+            panic!()
+        };
+        assert_eq!(step.oversized_results, 1);
+        assert!(step.prompt.contains("result too large"));
+        assert!(!step.prompt.contains("xxxx"));
+    }
+
+    #[test]
+    fn tool_results_must_match_the_pending_calls() {
+        let mut agent = agent_with(FakeGenerator::script(&[PARIS_CALL, "It is sunny."]));
+        assert!(matches!(start(&mut agent), StepOutcome::NeedTools { .. }));
+
+        for results in [
+            vec![],
+            vec![("call_7".to_string(), sunny())],
+            vec![
+                ("call_0".to_string(), sunny()),
+                ("call_0".to_string(), sunny()),
+            ],
+        ] {
+            let outcome = pollster::block_on(agent.provide_tool_results(results));
+            assert!(matches!(outcome, StepOutcome::Error { .. }), "{outcome:?}");
+        }
+        // The agent was left as it was: the right id continues the turn.
+        assert!(matches!(
+            provide(&mut agent, sunny()),
+            StepOutcome::Final { .. }
+        ));
+    }
+
+    #[test]
+    fn start_from_mcp_takes_tools_without_a_description() {
+        let mut agent = agent_with(FakeGenerator::script(&[
+            "<tool_call>\n{\"name\": \"ping\"}\n</tool_call>",
+        ]));
+        let outcome = pollster::block_on(
+            agent.start_from_mcp("ping it", &[serde_json::json!({"name": "ping"})]),
+        );
+        let StepOutcome::NeedTools { calls, .. } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(calls[0].name, "ping");
+        assert_eq!(calls[0].arguments, serde_json::json!({}));
     }
 }

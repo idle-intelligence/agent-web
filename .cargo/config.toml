@@ -1,0 +1,5 @@
+# wasm32 SIMD128 in every wasm build of this workspace (lean's CPU forward
+# pass uses SIMD128 kernels when it is compiled in). Every browser with
+# WebGPU or a recent wasm engine supports it.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]
