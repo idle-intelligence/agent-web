@@ -20,7 +20,7 @@
 
 use std::io::Write;
 
-use agent::agent::{Agent, FixtureCaller, StepOutcome, Tool, ToolCaller};
+use agent::agent::{tools_from_mcp, Agent, FixtureCaller, StepOutcome, ToolCaller};
 use agent::lean_generator::LeanGenerator;
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -65,16 +65,7 @@ fn main() -> Result<()> {
     let raw_tools: Vec<Value> = serde_json::from_str(
         &std::fs::read_to_string(&args.tools).with_context(|| format!("reading {}", args.tools))?,
     )?;
-    let tools: Vec<Tool> = raw_tools
-        .iter()
-        .filter_map(|t| {
-            Some(Tool::from_mcp(
-                t.get("name")?.as_str()?,
-                t.get("description")?.as_str()?,
-                t.get("inputSchema")?.clone(),
-            ))
-        })
-        .collect();
+    let tools = tools_from_mcp(&raw_tools).with_context(|| format!("reading {}", args.tools))?;
 
     let results_dir = std::path::Path::new(&args.tools)
         .parent()

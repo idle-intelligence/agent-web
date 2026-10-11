@@ -7,7 +7,9 @@
 //! Native only (`std::fs`, `std::time::Instant`); not part of the wasm
 //! build.
 
-use crate::agent::{Agent, FixtureCaller, Generator, StepOutcome, Tool, ToolCall, ToolCaller};
+use crate::agent::{
+    tools_from_mcp, Agent, FixtureCaller, Generator, StepOutcome, Tool, ToolCall, ToolCaller,
+};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
@@ -64,17 +66,7 @@ fn load_mcp_tools(path: impl AsRef<Path>) -> Result<Vec<Tool>> {
     let raw: Vec<Value> = serde_json::from_str(
         &std::fs::read_to_string(path).with_context(|| format!("reading tools from {path:?}"))?,
     )?;
-    raw.into_iter()
-        .map(|t| {
-            let name = t["name"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("tool entry missing string `name`: {t}"))?;
-            let description = t["description"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("tool entry missing string `description`: {t}"))?;
-            Ok(Tool::from_mcp(name, description, t["inputSchema"].clone()))
-        })
-        .collect()
+    tools_from_mcp(&raw).with_context(|| format!("reading tools from {path:?}"))
 }
 
 pub fn load_all_tools(fixtures_dir: impl AsRef<Path>) -> Result<Vec<Tool>> {

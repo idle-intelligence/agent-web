@@ -57,6 +57,33 @@ impl Tool {
             },
         }
     }
+
+    /// Reads one MCP `tools/list` entry. `name` is required; a missing or
+    /// `null` `description` reads as `""` and a missing `inputSchema` as
+    /// an object schema with no properties (both are optional in MCP).
+    pub fn try_from_mcp(entry: &Value) -> Result<Self> {
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .with_context(|| format!("MCP tool entry has no string `name`: {entry}"))?;
+        let description = match entry.get("description") {
+            None | Some(Value::Null) => "",
+            Some(Value::String(s)) => s,
+            Some(other) => bail!("MCP tool `{name}`: `description` is not a string: {other}"),
+        };
+        let input_schema = match entry.get("inputSchema") {
+            None | Some(Value::Null) => serde_json::json!({"type": "object", "properties": {}}),
+            Some(schema @ Value::Object(_)) => schema.clone(),
+            Some(other) => bail!("MCP tool `{name}`: `inputSchema` is not an object: {other}"),
+        };
+        Ok(Tool::from_mcp(name, description, input_schema))
+    }
+}
+
+/// Reads an MCP `tools/list` array with [`Tool::try_from_mcp`]; the first
+/// invalid entry is an error naming it.
+pub fn tools_from_mcp(entries: &[Value]) -> Result<Vec<Tool>> {
+    entries.iter().map(Tool::try_from_mcp).collect()
 }
 
 // ---------------------------------------------------------------------
@@ -144,7 +171,26 @@ pub enum ParsedOutput {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct RawToolCall {
     name: String,
-    arguments: Value,
+    #[serde(default)]
+    arguments: Option<Value>,
+}
+
+/// A call's `arguments` as a JSON object: missing or `null` is `{}`, and a
+/// string holding a JSON object (double-encoded) is that object.
+fn call_arguments(name: &str, arguments: Option<Value>) -> Result<Value, String> {
+    match arguments {
+        None | Some(Value::Null) => Ok(Value::Object(Default::default())),
+        Some(args @ Value::Object(_)) => Ok(args),
+        Some(Value::String(s)) => match serde_json::from_str::<Value>(&s) {
+            Ok(args @ Value::Object(_)) => Ok(args),
+            _ => Err(format!(
+                "arguments of `{name}` are not a JSON object: {s:?}"
+            )),
+        },
+        Some(other) => Err(format!(
+            "arguments of `{name}` are not a JSON object: {other}"
+        )),
+    }
 }
 
 /// Parse one turn of raw (decoded) model output.
@@ -152,7 +198,7 @@ struct RawToolCall {
 /// - A trailing `<|im_end|>` (and whitespace before it) is stripped first.
 /// - Every `<tool_call>...</tool_call>` block found is parsed as one call;
 ///   a block whose contents don't parse as `{"name", "arguments"}` is an
-///   error, not a panic.
+///   error, not a panic. A call with no `arguments` has empty arguments.
 /// - With no `<tool_call>` block at all, the (trimmed) text is the plain
 ///   answer.
 pub fn parse_output(raw: &str) -> Result<ParsedOutput, String> {
@@ -176,9 +222,10 @@ pub fn parse_output(raw: &str) -> Result<ParsedOutput, String> {
         let body = after_open[..end].trim();
         let raw_call: RawToolCall = serde_json::from_str(body)
             .map_err(|e| format!("malformed tool_call JSON {body:?}: {e}"))?;
+        let arguments = call_arguments(&raw_call.name, raw_call.arguments)?;
         calls.push(ToolCall {
             name: raw_call.name,
-            arguments: raw_call.arguments,
+            arguments,
         });
         rest = &after_open[end + CLOSE.len()..];
     }
@@ -234,9 +281,13 @@ fn tool_message(name: &str, content: String) -> Message {
 }
 
 /// If `result` is an MCP-shaped error (`isError: true` or a top-level
-/// `error` field), extract a human-readable message; `None` otherwise.
+/// `error` field that is not `null` or `false`), extract a human-readable
+/// message; `None` otherwise.
 pub fn tool_error_message(result: &Value) -> Option<String> {
-    if let Some(error) = result.get("error") {
+    if let Some(error) = result
+        .get("error")
+        .filter(|e| !matches!(e, Value::Null | Value::Bool(false)))
+    {
         let message = match error {
             Value::String(s) => s.clone(),
             Value::Object(o) => o
@@ -507,18 +558,16 @@ impl<G: Generator, C: ToolCaller> Agent<G, C> {
         self.step_inner().await
     }
 
+    /// [`Agent::start`] with the tools of an MCP `tools/list` array, read
+    /// with [`tools_from_mcp`]; an invalid entry is an `Error` outcome.
     pub async fn start_from_mcp(&mut self, utterance: &str, raw_tools: &[Value]) -> StepOutcome {
-        let tools: Vec<Tool> = raw_tools
-            .iter()
-            .filter_map(|t| {
-                Some(Tool::from_mcp(
-                    t.get("name")?.as_str()?,
-                    t.get("description")?.as_str()?,
-                    t.get("inputSchema")?.clone(),
-                ))
-            })
-            .collect();
-        self.start(utterance, &tools).await
+        match tools_from_mcp(raw_tools) {
+            Ok(tools) => self.start(utterance, &tools).await,
+            Err(e) => StepOutcome::Error {
+                message: format!("reading tools: {e:#}"),
+                step: None,
+            },
+        }
     }
 
     /// Continue the current turn with the results of the tool calls from
@@ -894,6 +943,64 @@ mod tests {
     #[test]
     fn parse_error_on_malformed_tool_call() {
         assert!(parse_output("<tool_call>\nnot json\n</tool_call>").is_err());
+    }
+
+    #[test]
+    fn call_without_arguments_has_empty_arguments() {
+        let empty = serde_json::json!({});
+        for raw in [
+            "<tool_call>\n{\"name\": \"a\"}\n</tool_call>",
+            "<tool_call>\n{\"name\": \"a\", \"arguments\": null}\n</tool_call>",
+            "<tool_call>\n{\"name\": \"a\", \"arguments\": \"{}\"}\n</tool_call>",
+        ] {
+            assert_eq!(
+                parse_output(raw).unwrap(),
+                ParsedOutput::ToolCalls(vec![ToolCall {
+                    name: "a".into(),
+                    arguments: empty.clone()
+                }]),
+                "{raw}"
+            );
+        }
+        assert!(
+            parse_output("<tool_call>\n{\"name\": \"a\", \"arguments\": 3}\n</tool_call>").is_err()
+        );
+    }
+
+    #[test]
+    fn mcp_tools_without_description_or_schema_are_accepted() {
+        let tools = tools_from_mcp(&[
+            serde_json::json!({"name": "ping"}),
+            serde_json::json!({"name": "echo", "description": null, "inputSchema": {"type": "object"}}),
+        ])
+        .unwrap();
+        assert_eq!(tools[0].function.name, "ping");
+        assert_eq!(tools[0].function.description, "");
+        assert_eq!(
+            tools[0].function.parameters,
+            serde_json::json!({"type": "object", "properties": {}})
+        );
+        assert_eq!(tools[1].function.description, "");
+        assert!(tools_from_mcp(&[serde_json::json!({"description": "no name"})]).is_err());
+        assert!(
+            tools_from_mcp(&[serde_json::json!({"name": "x", "inputSchema": "nope"})]).is_err()
+        );
+    }
+
+    #[test]
+    fn null_or_false_error_field_is_not_an_error() {
+        assert_eq!(
+            tool_error_message(&serde_json::json!({"error": null, "ok": 1})),
+            None
+        );
+        assert_eq!(
+            tool_error_message(&serde_json::json!({"error": false})),
+            None
+        );
+        assert_eq!(
+            tool_error_message(&serde_json::json!({"error": "no such group"})),
+            Some("no such group".to_string())
+        );
     }
 
     #[test]
