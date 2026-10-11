@@ -14,3 +14,5 @@ pub mod eval;
 pub mod generator;
 #[cfg(feature = "lean")]
 pub mod lean_generator;
+#[cfg(test)]
+mod test_support;

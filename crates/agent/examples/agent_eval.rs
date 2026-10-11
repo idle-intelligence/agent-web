@@ -11,7 +11,7 @@
 //! The model runs on lean's engine, which picks its backend by capability.
 //! `AGENT_EVAL_MAX_CTX` sets the KV cache size in tokens (default 4096).
 
-use agent::agent::{Agent, FixtureCaller};
+use agent::agent::Agent;
 use agent::eval::{load_all_tools, load_cases, render_markdown, run_all, select_tools, ToolSet};
 use agent::lean_generator::LeanGenerator;
 use lean::{Backend, GgufSource, LoadOptions, TokenizerSource};
@@ -47,8 +47,7 @@ fn main() -> anyhow::Result<()> {
     }))?;
     let backend = generator.backend();
     eprintln!("backend: {backend}");
-    let caller = FixtureCaller::new(results_dir.clone()); // replaced per case by run_all
-    let mut agent = Agent::new(template, generator, caller, system_prompt, max_new_tokens);
+    let mut agent = Agent::new(template, generator, system_prompt, max_new_tokens);
     agent.set_max_steps(max_steps);
 
     let date = std::env::var("AGENT_EVAL_DATE").unwrap_or_else(|_| "2026-10-08".to_string());

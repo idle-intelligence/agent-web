@@ -8,7 +8,7 @@
 //! build.
 
 use crate::agent::{
-    tools_from_mcp, Agent, FixtureCaller, Generator, StepOutcome, Tool, ToolCall, ToolCaller,
+    call_or_error, tools_from_mcp, Agent, Generator, StepOutcome, Tool, ToolCall, ToolCaller,
 };
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -44,6 +44,32 @@ pub struct EvalCase {
     pub notes: String,
     #[serde(default)]
     pub lang: Option<String>,
+}
+
+/// A [`ToolCaller`] that serves canned JSON results from
+/// `<results_dir>/<tool>.json` and records every call it saw, in order.
+pub struct FixtureCaller {
+    results_dir: std::path::PathBuf,
+    pub calls_seen: Vec<(String, Value)>,
+}
+
+impl FixtureCaller {
+    pub fn new(results_dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            results_dir: results_dir.into(),
+            calls_seen: Vec::new(),
+        }
+    }
+}
+
+impl ToolCaller for FixtureCaller {
+    fn call(&mut self, name: &str, args: &Value) -> Result<Value> {
+        self.calls_seen.push((name.to_string(), args.clone()));
+        let path = self.results_dir.join(format!("{name}.json"));
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading fixture result {path:?}"))?;
+        Ok(serde_json::from_str(&text)?)
+    }
 }
 
 pub fn load_cases(path: impl AsRef<Path>) -> Result<Vec<EvalCase>> {
@@ -296,7 +322,7 @@ pub fn score(
 }
 
 pub async fn run_case<G: Generator>(
-    agent: &mut Agent<G, FixtureCaller>,
+    agent: &mut Agent<G>,
     tools: &[Tool],
     case: &EvalCase,
     caller: &mut FixtureCaller,
@@ -325,9 +351,7 @@ pub async fn run_case<G: Generator>(
                 accumulate(&step);
                 let mut results = Vec::with_capacity(calls.len());
                 for call in &calls {
-                    let result = caller
-                        .call(&call.name, &call.arguments)
-                        .unwrap_or(Value::Null);
+                    let result = call_or_error(caller, call);
                     if call.name == "get_households_and_groups_and_players" {
                         households = Some(result.clone());
                     }
@@ -413,7 +437,7 @@ pub struct EvalReport {
 }
 
 pub async fn run_all<G: Generator>(
-    agent: &mut Agent<G, FixtureCaller>,
+    agent: &mut Agent<G>,
     tools: &[Tool],
     cases: &[EvalCase],
     tool_set: ToolSet,

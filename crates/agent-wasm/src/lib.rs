@@ -21,20 +21,11 @@
 
 use wasm_bindgen::prelude::*;
 
-use agent::agent::{AbortFlag, Agent, PendingToolCall, StepOutcome, ToolCaller};
+use agent::agent::{AbortFlag, Agent, PendingToolCall, StepOutcome};
 use agent::lean_generator::LeanGenerator;
 use anyhow::Result;
 use lean::{Backend, GgufSource, LoadOptions, TokenizerSource};
 use serde_json::Value;
-
-/// No-op `ToolCaller`: the step-wise wasm API never calls tools itself,
-/// the page does and passes the results to `provideToolResults`.
-struct NoCaller;
-impl ToolCaller for NoCaller {
-    fn call(&mut self, name: &str, _args: &Value) -> Result<Value> {
-        anyhow::bail!("the agent never calls tools itself (tool: {name}); the page does, via provideToolResults")
-    }
-}
 
 fn outcome_to_json(outcome: StepOutcome) -> String {
     match outcome {
@@ -69,7 +60,7 @@ impl AgentAbort {
 
 #[wasm_bindgen(js_name = Agent)]
 pub struct AgentJs {
-    agent: Agent<LeanGenerator, NoCaller>,
+    agent: Agent<LeanGenerator>,
 }
 
 #[wasm_bindgen(js_class = Agent)]
@@ -99,13 +90,7 @@ impl AgentJs {
         .await
         .map_err(|e| JsError::new(&format!("failed to load model: {e}")))?;
         Ok(AgentJs {
-            agent: Agent::new(
-                template,
-                generator,
-                NoCaller,
-                system_prompt,
-                max_new_tokens as usize,
-            ),
+            agent: Agent::new(template, generator, system_prompt, max_new_tokens as usize),
         })
     }
 

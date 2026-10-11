@@ -5,12 +5,12 @@
 //! cargo run -p agent --example agent_cli --release -- \
 //!   --model /path/to/model.gguf \
 //!   --tokenizer /path/to/tokenizer_dir \
-//!   --tools fixtures/sonos/tools-subset.json \
+//!   --tools crates/agent/fixtures/sonos/tools-subset.json \
 //!   --utterance "pause the kitchen"
 //! ```
 //!
 //! Tool calls are answered from `<tools-dir>/results/<tool>.json` fixture
-//! files next to the tools file (see `fixtures/sonos/results/`), same
+//! files next to the tools file (see `crates/agent/fixtures/sonos/results/`), same
 //! shape the eval harness uses; there is no live MCP connection here.
 //!
 //! The model runs on lean's engine, which picks its backend by capability
@@ -20,7 +20,8 @@
 
 use std::io::Write;
 
-use agent::agent::{tools_from_mcp, Agent, FixtureCaller, StepOutcome, ToolCaller};
+use agent::agent::{call_or_error, tools_from_mcp, Agent, StepOutcome};
+use agent::eval::FixtureCaller;
 use agent::lean_generator::LeanGenerator;
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -71,11 +72,7 @@ fn main() -> Result<()> {
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("results");
-    // One FixtureCaller to satisfy `Agent`'s generic `ToolCaller` type
-    // parameter (unused: this CLI drives the loop step-wise and never
-    // calls `Agent::run`, so `self.caller` inside `Agent` is never
-    // invoked) and a second, actually used, to answer tool calls below.
-    let mut tool_runner = FixtureCaller::new(results_dir.clone());
+    let mut tool_runner = FixtureCaller::new(results_dir);
 
     let generator = pollster::block_on(LeanGenerator::load(LoadOptions {
         gguf: GgufSource::Path(args.model.clone()),
@@ -84,13 +81,7 @@ fn main() -> Result<()> {
         backend: Backend::Auto,
     }))?;
     eprintln!("backend: {}", generator.backend());
-    let mut agent = Agent::new(
-        template,
-        generator,
-        FixtureCaller::new(results_dir),
-        args.system_prompt,
-        args.max_new_tokens,
-    );
+    let mut agent = Agent::new(template, generator, args.system_prompt, args.max_new_tokens);
     agent.set_max_steps(args.max_steps);
     agent.set_on_text(|text| {
         eprint!("{text}");
@@ -111,9 +102,7 @@ fn main() -> Result<()> {
                 let mut results = Vec::with_capacity(calls.len());
                 for call in &calls {
                     println!("step: tool call {}({})", call.name, call.arguments);
-                    let result = tool_runner
-                        .call(&call.name, &call.arguments)
-                        .unwrap_or(Value::Null);
+                    let result = call_or_error(&mut tool_runner, call);
                     println!("  result: {result}");
                     results.push((call.call_id.clone(), result));
                 }

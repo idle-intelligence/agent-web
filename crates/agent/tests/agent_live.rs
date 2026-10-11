@@ -4,7 +4,7 @@
 //! pick the one tool it's given and call it, then answer in text once it
 //! has the result. Doesn't assert on the wording of the final answer
 //! (that's a model-quality question, not a correctness one); see
-//! `docs/runs/2026-10-07-mcp-agent-lean.md` for scored eval runs.
+//! `docs/runs/` for scored eval runs.
 //!
 //! Ignored by default (needs the GGUF + tokenizer files on disk):
 //!
@@ -57,14 +57,17 @@ fn agent_live_calls_tool_then_answers() {
     let mut agent = Agent::new(
         template,
         generator,
-        WeatherCaller,
         "You are a helpful assistant with access to tools. Use them when needed.",
         96,
     );
 
-    let transcript =
-        pollster::block_on(agent.run("What's the weather like in Paris right now?", &[tool], 4))
-            .expect("agent run failed");
+    agent.set_max_steps(4);
+    let transcript = pollster::block_on(agent.run(
+        "What's the weather like in Paris right now?",
+        &[tool],
+        &mut WeatherCaller,
+    ))
+    .expect("agent run failed");
 
     assert!(!transcript.steps.is_empty());
     let first = &transcript.steps[0];
