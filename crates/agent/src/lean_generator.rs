@@ -3,7 +3,11 @@
 //! then on one thread) and reuses the KV cache of the previous call for the
 //! longest prefix the next prompt shares with it, so each agent step only
 //! prefills what the previous one did not already hold (the system prompt
-//! and tools are prefilled once per conversation). One agent per engine.
+//! and tools are prefilled once per turn). One agent per engine.
+//!
+//! lean checks for an abort once per decoded token, not during prefill;
+//! the agent's flag reaches lean's own flag each time a piece of text is
+//! streamed.
 
 use lean::{GenParams, Lean, LeanError, LoadOptions};
 
@@ -41,7 +45,7 @@ impl Generator for LeanGenerator {
             return Err(GenerateError::Aborted);
         }
         let params = GenParams {
-            max_new_tokens: max_new_tokens as u32,
+            max_new_tokens: u32::try_from(max_new_tokens).unwrap_or(u32::MAX),
             temperature: 0.0,
             ..GenParams::default()
         };

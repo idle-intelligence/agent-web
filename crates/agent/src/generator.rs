@@ -73,14 +73,17 @@ impl AbortFlag {
     }
 }
 
-/// An engine that completes text.
+/// An engine that completes text. The agent loop drives it from one
+/// thread (a browser worker, or a blocking executor natively), so the
+/// returned future does not need to be `Send`.
 pub trait Generator {
     /// Generates the continuation of `prompt`, exactly as given (the
     /// prompt is already rendered with the chat template), up to
     /// `max_new_tokens` tokens, stopping early at the model's
     /// end-of-sequence token. Each piece of the reply goes to `on_text` as
     /// soon as it is decoded; the whole reply is returned. Returns
-    /// [`GenerateError::Aborted`] once `abort` is set.
+    /// [`GenerateError::Aborted`] once `abort` is set, at the engine's
+    /// next check.
     fn generate(
         &mut self,
         prompt: &str,
