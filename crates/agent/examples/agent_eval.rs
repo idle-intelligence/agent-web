@@ -21,7 +21,7 @@ fn main() -> anyhow::Result<()> {
     let tokenizer_dir =
         std::env::var("LEAN_TOKENIZER_DIR_QWEN25_3B").expect("set LEAN_TOKENIZER_DIR_QWEN25_3B");
     let repo_root = std::env::var("AGENT_EVAL_REPO_ROOT")
-        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/..").to_string());
+        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../..").to_string());
 
     let max_ctx: u32 = std::env::var("AGENT_EVAL_MAX_CTX")
         .map(|s| s.parse().expect("AGENT_EVAL_MAX_CTX must be a number"))
