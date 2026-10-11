@@ -1,14 +1,16 @@
-"""Reference fixture for `agent.rs`'s Qwen2.5-Instruct tools-template port.
+"""Reference fixture for the agent's Qwen2.5-Instruct tools-template prompts.
 
 Renders `tokenizer.apply_chat_template(messages, tools=..., add_generation_prompt=True)`
-through HF `transformers` itself (tokenizer only -- no model forward pass
-needed for a template/tokenization check), for the input cases in agent_inputs/ (01/02/04: OpenAI-shaped messages, which Qwen2.5's own template also accepts) plus one new multi-turn case this port's agent loop
-actually produces (object-shaped `tool_calls[].function.arguments`, two
-tool round trips).
+through HF `transformers` itself (tokenizer only, no model forward pass),
+for the input cases in `agent_inputs/*.json` (OpenAI-shaped messages, which
+Qwen2.5's own template accepts) plus one multi-turn case generated here,
+with object-shaped `tool_calls[].function.arguments` and two tool round
+trips, the shape the agent loop produces.
 
   LEAN_TOKENIZER_DIR_QWEN25_3B  directory with tokenizer.json + tokenizer_config.json
 
-venv: crates/agent/reference/.venv (gitignored; tokenizer-only, no torch needed).
+Run it in a venv with `transformers` installed (tokenizer only, no torch
+needed).
 """
 import json
 import os
