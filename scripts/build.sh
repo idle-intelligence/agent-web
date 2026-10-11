@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
-# Builds the agent-wasm package and assembles the deployed site into
-# _site/, following the pattern of llm-web's scripts/build.sh (build tag
-# rewrite, local-path leak check on the built wasm).
-#
-# The web/ page (phase 2 of this repo) is not built yet; this currently
-# just builds and checks the wasm package at _site/pkg. Once web/ exists,
-# add its copy and ENGINE_BUILD rewrite here, following llm-web's script.
+# Builds the agent-wasm package, checks the built wasm for local paths, and
+# copies the package to _site/pkg.
 #
 # Requires wasm-pack and wasm-bindgen-cli (version matching Cargo.lock's
 # wasm-bindgen exactly: `cargo install wasm-bindgen-cli --version <ver>
@@ -44,4 +39,4 @@ rm -rf _site
 mkdir -p _site/pkg
 cp -R crates/agent-wasm/pkg/. _site/pkg/
 
-echo "==> Wrote _site (pkg only; no page yet, see this script's header)"
+echo "==> Wrote _site/pkg"
