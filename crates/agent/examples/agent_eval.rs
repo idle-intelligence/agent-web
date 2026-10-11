@@ -32,7 +32,7 @@ fn main() -> anyhow::Result<()> {
     let fixtures_dir = format!("{repo_root}/crates/agent/fixtures/sonos");
     let results_dir = format!("{fixtures_dir}/results");
     let all_tools = load_all_tools(&fixtures_dir)?;
-    let tools = select_tools(&all_tools, ToolSet::Twelve, &fixtures_dir)?;
+    let tools = select_tools(&all_tools, ToolSet::Subset, &fixtures_dir)?;
     let cases = load_cases(format!("{repo_root}/eval/utterances.json"))?;
 
     let system_prompt = "You are a helpful home assistant with access to Sonos speaker controls.";
@@ -56,13 +56,13 @@ fn main() -> anyhow::Result<()> {
         &mut agent,
         &tools,
         &cases,
-        ToolSet::Twelve,
+        ToolSet::Subset,
         &results_dir,
         "Qwen2.5-3B-Instruct-q4_0.gguf (lean, capability-selected engine)",
         date,
     ));
     report.backend = format!("native, {backend}");
-    report.label = "base43".to_string();
+    report.label = "sonos-subset".to_string();
     report.system_prompt = system_prompt.to_string();
     report.max_new_tokens = max_new_tokens;
     report.max_steps = max_steps;

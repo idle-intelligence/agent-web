@@ -5,7 +5,7 @@
 //! cargo run -p agent --example agent_cli --release -- \
 //!   --model /path/to/model.gguf \
 //!   --tokenizer /path/to/tokenizer_dir \
-//!   --tools fixtures/sonos/tools-12.json \
+//!   --tools fixtures/sonos/tools-subset.json \
 //!   --utterance "pause the kitchen"
 //! ```
 //!

@@ -37,7 +37,7 @@ pub struct EvalCase {
     pub kind: String,
     pub expected: Vec<ExpectedCall>,
     pub accept: Accept,
-    pub tools12_ok: bool,
+    pub subset_ok: bool,
     #[serde(default)]
     pub notes: String,
     #[serde(default)]
@@ -51,28 +51,12 @@ pub fn load_cases(path: impl AsRef<Path>) -> Result<Vec<EvalCase>> {
     serde_json::from_str(&raw).with_context(|| format!("parsing eval cases from {path:?}"))
 }
 
+/// Which tools the agent is given: every tool in `tools.json`, or the
+/// eval subset in `tools-subset.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolSet {
     All,
-    Twelve,
-}
-
-impl ToolSet {
-    pub fn tool_count(&self) -> usize {
-        match self {
-            ToolSet::All => 34,
-            ToolSet::Twelve => 12,
-        }
-    }
-}
-
-impl std::fmt::Display for ToolSet {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ToolSet::All => write!(f, "34 tools"),
-            ToolSet::Twelve => write!(f, "12 tools"),
-        }
-    }
+    Subset,
 }
 
 fn load_mcp_tools(path: impl AsRef<Path>) -> Result<Vec<Tool>> {
@@ -97,8 +81,8 @@ pub fn load_all_tools(fixtures_dir: impl AsRef<Path>) -> Result<Vec<Tool>> {
     load_mcp_tools(fixtures_dir.as_ref().join("tools.json"))
 }
 
-/// Select the tools for a `ToolSet`, in `tools-12.json`'s own order for
-/// `Twelve` (the listing tool comes first; the model's greedy output
+/// Select the tools for a `ToolSet`, in `tools-subset.json`'s own order for
+/// `Subset` (the listing tool comes first; the model's greedy output
 /// depends on tool order, so this order is not arbitrary).
 pub fn select_tools(
     all: &[Tool],
@@ -107,9 +91,9 @@ pub fn select_tools(
 ) -> Result<Vec<Tool>> {
     match subset {
         ToolSet::All => Ok(all.to_vec()),
-        ToolSet::Twelve => {
-            let twelve = load_mcp_tools(fixtures_dir.as_ref().join("tools-12.json"))?;
-            twelve
+        ToolSet::Subset => {
+            let subset = load_mcp_tools(fixtures_dir.as_ref().join("tools-subset.json"))?;
+            subset
                 .iter()
                 .map(|t| {
                     all.iter()
@@ -117,7 +101,7 @@ pub fn select_tools(
                         .cloned()
                         .ok_or_else(|| {
                             anyhow::anyhow!(
-                                "tools-12.json tool `{}` not found in the full tool set",
+                                "tools-subset.json tool `{}` not found in the full tool set",
                                 t.function.name
                             )
                         })
@@ -408,7 +392,7 @@ fn skipped_result(case: &EvalCase) -> CaseResult {
         id: case.id.clone(),
         correct: false,
         skipped: true,
-        reason: "tools12_ok=false: not solvable under the 12-tool subset".to_string(),
+        reason: "subset_ok=false: not solvable under the 13-tool subset".to_string(),
         steps: 0,
         calls_made: Vec::new(),
         total_ms: 0.0,
@@ -421,6 +405,7 @@ fn skipped_result(case: &EvalCase) -> CaseResult {
 pub struct EvalReport {
     pub model: String,
     pub tool_set: ToolSet,
+    pub tool_count: usize,
     pub backend: String,
     pub date: String,
     pub results: Vec<CaseResult>,
@@ -447,7 +432,7 @@ pub async fn run_all<G: Generator>(
     let results_dir = results_dir.as_ref();
     let mut results = Vec::with_capacity(cases.len());
     for case in cases {
-        if tool_set == ToolSet::Twelve && !case.tools12_ok {
+        if tool_set == ToolSet::Subset && !case.subset_ok {
             results.push(skipped_result(case));
             continue;
         }
@@ -466,6 +451,7 @@ pub async fn run_all<G: Generator>(
     EvalReport {
         model: model.into(),
         tool_set,
+        tool_count: tools.len(),
         backend: "native".to_string(),
         date: date.into(),
         results,
@@ -487,18 +473,18 @@ pub fn render_markdown(report: &EvalReport) -> String {
 
     let _ = writeln!(
         out,
-        "# Sonos MCP agent eval (lean/Qwen2.5-3B-Instruct, unconstrained), {}",
-        report.date
+        "# Sonos MCP agent eval, {}, unconstrained, {}",
+        report.model, report.date
     );
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "## Run: {}, {}, {}, label={}",
-        report.model, report.tool_set, report.backend, report.label
+        "## Run: {}, {} tools, {}, label={}",
+        report.model, report.tool_count, report.backend, report.label
     );
     let _ = writeln!(out);
     let _ = writeln!(out, "- system: {:?}", report.system_prompt);
-    let _ = writeln!(out, "- tool_count: {}", report.tool_set.tool_count());
+    let _ = writeln!(out, "- tool_count: {}", report.tool_count);
     let _ = writeln!(out, "- max_new_tokens: {}", report.max_new_tokens);
     let _ = writeln!(out, "- max_steps: {}", report.max_steps);
     let _ = writeln!(out);

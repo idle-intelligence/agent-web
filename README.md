@@ -24,7 +24,7 @@ lean is inference only: text in, text out, on a backend it picks by capability (
 cargo run -p agent --example agent_cli --release -- \
   --model /path/to/qwen2.5-3b-instruct-q4_0.gguf \
   --tokenizer /path/to/Qwen2.5-3B-Instruct \
-  --tools crates/agent/fixtures/sonos/tools-12.json \
+  --tools crates/agent/fixtures/sonos/tools-subset.json \
   --utterance "pause the kitchen"
 ```
 
