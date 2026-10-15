@@ -36,6 +36,24 @@ pub enum Accept {
 pub struct ExpectedCall {
     pub name: String,
     pub args: Value,
+    /// Numeric arguments accepted anywhere in an inclusive `[min, max]`
+    /// range instead of at one value (an unquantified "a bit" volume
+    /// nudge). A key listed here is left out of `args`.
+    #[serde(default)]
+    pub arg_ranges: std::collections::BTreeMap<String, [f64; 2]>,
+}
+
+/// Another way for a case to pass: its own calls, acceptance mode and
+/// answer checks, scored as the case's are.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Alternative {
+    #[serde(default)]
+    pub expected: Vec<ExpectedCall>,
+    pub accept: Accept,
+    #[serde(default)]
+    pub answer_contains_any: Vec<String>,
+    #[serde(default)]
+    pub answer_contains_all: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -59,6 +77,9 @@ pub struct EvalCase {
     /// substrings (case-insensitive).
     #[serde(default)]
     pub answer_contains_all: Vec<String>,
+    /// The case also passes if any of these passes.
+    #[serde(default)]
+    pub alternatives: Vec<Alternative>,
 }
 
 /// A [`ToolCaller`] that serves canned JSON results from
@@ -339,11 +360,20 @@ pub struct CaseResult {
 
 const MAX_TOOL_CALLS: usize = 6;
 
-fn args_match(expected: &Value, made: &Value) -> bool {
-    match (expected, made) {
+fn ranges_match(expected: &ExpectedCall, made: &Value) -> bool {
+    expected.arg_ranges.iter().all(|(k, [lo, hi])| {
+        made.get(k)
+            .and_then(Value::as_f64)
+            .is_some_and(|v| (*lo..=*hi).contains(&v))
+    })
+}
+
+fn args_match(expected: &ExpectedCall, made: &Value) -> bool {
+    let plain = match (&expected.args, made) {
         (Value::Object(exp), Value::Object(got)) => exp.iter().all(|(k, v)| got.get(k) == Some(v)),
-        _ => expected == made,
-    }
+        _ => &expected.args == made,
+    };
+    plain && ranges_match(expected, made)
 }
 
 fn values_match_ci(expected: &Value, got: &Value) -> bool {
@@ -353,13 +383,14 @@ fn values_match_ci(expected: &Value, got: &Value) -> bool {
     }
 }
 
-fn args_match_ci(expected: &Value, made: &Value) -> bool {
-    match (expected, made) {
+fn args_match_ci(expected: &ExpectedCall, made: &Value) -> bool {
+    let plain = match (&expected.args, made) {
         (Value::Object(exp), Value::Object(got)) => exp
             .iter()
             .all(|(k, v)| got.get(k).is_some_and(|g| values_match_ci(v, g))),
-        _ => values_match_ci(expected, made),
-    }
+        _ => values_match_ci(&expected.args, made),
+    };
+    plain && ranges_match(expected, made)
 }
 
 /// Why the final text answer fails the case's `answer_contains_*`, if it
@@ -394,10 +425,45 @@ pub fn score(
 }
 
 /// Score `calls_made` (in order) against `case.expected`, then
-/// `final_text` against the case's `answer_contains_*`. `is_mutating`
-/// falls back to the `get_`-prefix heuristic since this fixture tool set
-/// carries no MCP `annotations`.
+/// `final_text` against the case's `answer_contains_*`; if that fails, the
+/// case's `alternatives` the same way, in order. `is_mutating` falls back
+/// to the `get_`-prefix heuristic since this fixture tool set carries no
+/// MCP `annotations`.
 pub fn score_with_answer(
+    case: &EvalCase,
+    calls_made: &[ToolCall],
+    households: Option<&Value>,
+    ended_in_final: bool,
+    final_text: Option<&str>,
+) -> (bool, String) {
+    let main = score_one(case, calls_made, households, ended_in_final, final_text);
+    if main.0 {
+        return main;
+    }
+    for (i, alt) in case.alternatives.iter().enumerate() {
+        let alt_case = EvalCase {
+            expected: alt.expected.clone(),
+            accept: alt.accept,
+            answer_contains_any: alt.answer_contains_any.clone(),
+            answer_contains_all: alt.answer_contains_all.clone(),
+            alternatives: Vec::new(),
+            ..case.clone()
+        };
+        let (ok, reason) = score_one(
+            &alt_case,
+            calls_made,
+            households,
+            ended_in_final,
+            final_text,
+        );
+        if ok {
+            return (true, format!("alternative {i}: {reason}"));
+        }
+    }
+    main
+}
+
+fn score_one(
     case: &EvalCase,
     calls_made: &[ToolCall],
     households: Option<&Value>,
@@ -465,9 +531,10 @@ fn score_calls(
             if !required.is_empty() {
                 let mut cursor = 0usize;
                 for expected in &required {
-                    match calls_made[cursor..].iter().position(|c| {
-                        c.name == expected.name && args_match(&expected.args, &c.arguments)
-                    }) {
+                    match calls_made[cursor..]
+                        .iter()
+                        .position(|c| c.name == expected.name && args_match(expected, &c.arguments))
+                    {
                         Some(offset) => cursor += offset + 1,
                         None => {
                             return (
@@ -490,7 +557,7 @@ fn score_calls(
                 };
                 if calls_made
                     .iter()
-                    .any(|c| c.name == last.name && args_match(&last.args, &c.arguments))
+                    .any(|c| c.name == last.name && args_match(last, &c.arguments))
                 {
                     (true, "final read made with correct args".to_string())
                 } else {
@@ -561,7 +628,7 @@ fn score_calls(
             }
             for (i, expected) in case.expected.iter().enumerate() {
                 let made = &calls_made[i];
-                if made.name != expected.name || !args_match_ci(&expected.args, &made.arguments) {
+                if made.name != expected.name || !args_match_ci(expected, &made.arguments) {
                     return (
                         false,
                         format!(
@@ -1100,6 +1167,103 @@ mod tests {
         assert!(caller.call("get_now_playing", &json!({})).is_err());
     }
 
+    #[test]
+    fn unquantified_nudges_accept_any_delta_of_the_right_sign_up_to_20() {
+        let adjust = |group: &str, delta: i64| {
+            call(
+                "adjust_group_volume",
+                json!({"group_id": group, "volume_delta": delta}),
+            )
+        };
+        let living = "RINCON_LIVING01:2";
+        let s16 = case("s16");
+        for delta in [-1, -5, -10, -20] {
+            assert!(
+                score(&s16, &[adjust(living, delta)], None, true).0,
+                "{delta}"
+            );
+        }
+        for delta in [0, 5, -21] {
+            assert!(
+                !score(&s16, &[adjust(living, delta)], None, true).0,
+                "{delta}"
+            );
+        }
+        assert!(!score(&s16, &[adjust("RINCON_KITCHEN01:1", -5)], None, true).0);
+        let m26 = case("m26");
+        assert!(score(&m26, &[adjust(living, 5)], None, true).0);
+        assert!(!score(&m26, &[adjust(living, -5)], None, true).0);
+        let m23 = case("m23");
+        let pause = call("pause", json!({"group_id": "RINCON_KITCHEN01:1"}));
+        assert!(
+            score(
+                &m23,
+                &[pause.clone(), adjust("RINCON_BEDROOM01:3", 15)],
+                None,
+                true
+            )
+            .0
+        );
+        let set = call(
+            "set_group_volume",
+            json!({"group_id": "RINCON_BEDROOM01:3", "volume": 60}),
+        );
+        assert!(!score(&m23, &[pause, set], None, true).0);
+        let m08 = case("m08");
+        assert!(!score(&m08, &[adjust("RINCON_KITCHEN01:1", 5)], None, true).0);
+    }
+
+    #[test]
+    fn s14_accepts_the_lookup_and_an_idle_answer() {
+        let c = case("s14");
+        let listing = call("get_households_and_groups_and_players", json!({}));
+        let made = std::slice::from_ref(&listing);
+        let idle = "The bedroom is currently idle, meaning no music is playing.";
+        assert!(score_with_answer(&c, made, None, true, Some(idle)).0);
+        assert!(score_with_answer(&c, made, None, true, Some("Nothing is playing there.")).0);
+        let wrong = "The bedroom is playing Radiohead.";
+        assert!(!score_with_answer(&c, made, None, true, Some(wrong)).0);
+        assert!(!score_with_answer(&c, &[], None, true, Some(idle)).0);
+        let now = call("get_now_playing", json!({"group_id": "RINCON_BEDROOM01:3"}));
+        assert!(score_with_answer(&c, &[listing, now], None, true, Some("Idle.")).0);
+    }
+
+    #[test]
+    fn m22_accepts_a_clarifying_question_with_no_mutation() {
+        let c = case("m22");
+        let households = households();
+        let h = Some(&households);
+        let ask = "What would you like me to play, and in which room?";
+        assert!(score_with_answer(&c, &[], h, true, Some(ask)).0);
+        assert!(!score_with_answer(&c, &[], h, true, Some("Okay.")).0);
+        let bad_play = call(
+            "play_artist",
+            json!({"group_id": "garage", "artist": "x", "shuffle": false}),
+        );
+        assert!(!score_with_answer(&c, &[bad_play], h, true, Some(ask)).0);
+        let play = call(
+            "play_sonos_favorite",
+            json!({"group_id": "RINCON_KITCHEN01:1", "favorite_id": "FV:1", "shuffle": false}),
+        );
+        assert!(score_with_answer(&c, &[play], h, true, Some("Playing.")).0);
+    }
+
+    #[test]
+    fn m27_unknown_speaker_expects_no_mutation() {
+        let c = case("m27");
+        let listing = call("get_households_and_groups_and_players", json!({}));
+        let made = std::slice::from_ref(&listing);
+        assert!(score(&c, made, None, true).0);
+        let play = |group: &str| {
+            call(
+                "play_artist",
+                json!({"group_id": group, "artist": "Nirvana", "shuffle": false}),
+            )
+        };
+        assert!(!score(&c, &[play("BLOUPBLIP")], None, true).0);
+        assert!(!score(&c, &[listing, play("RINCON_KITCHEN01:1")], None, true).0);
+    }
+
     fn two_step_cases() -> Vec<EvalCase> {
         load_cases(format!(
             "{REPO_ROOT}/crates/agent/fixtures/two-step/cases.json"
@@ -1129,6 +1293,7 @@ mod tests {
         c.expected = vec![ExpectedCall {
             name: "get_weather".into(),
             args: json!({"city": "Lyon"}),
+            arg_ranges: Default::default(),
         }];
         c.answer_contains_any = vec!["17".into(), "rain".into()];
         let made = [call(

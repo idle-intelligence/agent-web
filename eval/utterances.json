@@ -501,7 +501,27 @@
     ],
     "accept": "subset",
     "subset_ok": true,
-    "notes": "Bedroom is IDLE in the canned household; the correct call is still get_now_playing on the bedroom's group id, regardless of playback state."
+    "notes": "Bedroom is IDLE in the canned household. get_now_playing on the bedroom's group id passes; so does the household lookup followed by an answer that the bedroom is idle or that nothing is playing there, since the listing already gives the bedroom's playbackState.",
+    "alternatives": [
+      {
+        "expected": [
+          {
+            "name": "get_households_and_groups_and_players",
+            "args": {}
+          }
+        ],
+        "accept": "subset",
+        "answer_contains_any": [
+          "idle",
+          "nothing",
+          "not playing",
+          "not currently playing",
+          "no music",
+          "isn't playing",
+          "is not playing"
+        ]
+      }
+    ]
   },
   {
     "id": "s15",
@@ -535,14 +555,19 @@
       {
         "name": "adjust_group_volume",
         "args": {
-          "group_id": "RINCON_LIVING01:2",
-          "volume_delta": -10
+          "group_id": "RINCON_LIVING01:2"
+        },
+        "arg_ranges": {
+          "volume_delta": [
+            -20,
+            -1
+          ]
         }
       }
     ],
     "accept": "subset",
     "subset_ok": true,
-    "notes": "No room named: the playing group (Living Room) is the canonical target, same as s01/s15. Delta convention: an unquantified 'a bit'/'a little' nudge is ±10; this case is the 'down' direction."
+    "notes": "No room named: the playing group (Living Room) is the canonical target, same as s01/s15. An unquantified 'a bit' nudge has no single right size, so any volume_delta from -20 to -1 is accepted (the 'down' direction)."
   },
   {
     "id": "s17",
@@ -776,7 +801,16 @@
     "expected": [],
     "accept": "any_play",
     "subset_ok": true,
-    "notes": "Fully ambiguous request: no room, artist, track, station, or playlist named. Any single play_* call with a valid group_id is accepted (accept 'any_play'); there is no one canonical expected sequence."
+    "notes": "Fully ambiguous request: no room, artist, track, station, or playlist named. Any single play_* call with a valid group_id is accepted (accept 'any_play'); so is no mutating call and a text answer that asks what to play (a question mark in the answer).",
+    "alternatives": [
+      {
+        "expected": [],
+        "accept": "no_mutation",
+        "answer_contains_any": [
+          "?"
+        ]
+      }
+    ]
   },
   {
     "id": "m23",
@@ -796,14 +830,19 @@
       {
         "name": "adjust_group_volume",
         "args": {
-          "group_id": "RINCON_BEDROOM01:3",
-          "volume_delta": 10
+          "group_id": "RINCON_BEDROOM01:3"
+        },
+        "arg_ranges": {
+          "volume_delta": [
+            1,
+            20
+          ]
         }
       }
     ],
     "accept": "subset",
     "subset_ok": true,
-    "notes": "Two rooms, two different actions in one utterance: it tests that the model doesn't apply one action to both rooms. Volume delta uses the same ±10 'a bit' convention as s16 (this is the 'up' direction, unquantified)."
+    "notes": "Two rooms, two different actions in one utterance: it tests that the model doesn't apply one action to both rooms. 'Turn up' has no number, so any volume_delta from 1 to 20 is accepted, as for s16 (the 'up' direction)."
   },
   {
     "id": "m24",
@@ -859,36 +898,28 @@
       {
         "name": "adjust_group_volume",
         "args": {
-          "group_id": "RINCON_LIVING01:2",
-          "volume_delta": 10
+          "group_id": "RINCON_LIVING01:2"
+        },
+        "arg_ranges": {
+          "volume_delta": [
+            1,
+            20
+          ]
         }
       }
     ],
     "accept": "subset",
     "subset_ok": true,
-    "notes": "French for 'Turn up the living room's volume', unquantified. Uses the same ±10 'a bit' delta convention as s16/m23 ('salon' = living room)."
+    "notes": "French for 'Turn up the living room's volume', unquantified ('salon' = living room). Any volume_delta from 1 to 20 is accepted, as for s16 and m23."
   },
   {
     "id": "m27",
     "utterance": "Play nirvana on BLOUPBLIP.",
     "kind": "multi",
-    "expected": [
-      {
-        "name": "get_households_and_groups_and_players",
-        "args": {}
-      },
-      {
-        "name": "play_artist",
-        "args": {
-          "group_id": "RINCON_KITCHEN01:1",
-          "artist": "Nirvana",
-          "shuffle": false
-        }
-      }
-    ],
-    "accept": "subset",
+    "expected": [],
+    "accept": "no_mutation",
     "subset_ok": true,
-    "notes": "Same pattern as m11 but with a speaker name ('BLOUPBLIP') that has no match in the fixture household; the expected call uses the fixture's kitchen group id (RINCON_KITCHEN01:1) as a stand-in target the way m11/m13 do, since the fixture has no room named 'bloupblip'. With no id known yet, the model should call get_households_and_groups_and_players first rather than answer with a prose refusal on step 0."
+    "notes": "Same pattern as m11 but with a speaker name ('BLOUPBLIP') that has no match in the fixture household. As for m21, expect no mutating tool call: the model should say it can't find that speaker, not guess an id. A read such as the household lookup first is allowed."
   },
   {
     "id": "m28",
