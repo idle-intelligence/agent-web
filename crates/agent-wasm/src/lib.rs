@@ -24,7 +24,7 @@ use std::cell::RefCell;
 
 use wasm_bindgen::prelude::*;
 
-use agent::agent::{AbortFlag, Agent, PendingToolCall, StepOutcome};
+use agent::agent::{AbortFlag, Agent, PendingToolCall, StepOutcome, Thinking};
 use agent::lean_generator::LeanGenerator;
 use anyhow::Result;
 use lean::{Backend, GgufSource, LoadOptions, TokenizerSource};
@@ -118,6 +118,30 @@ impl AgentJs {
         agent.set_on_text(move |text| {
             let _ = on_text.call1(&JsValue::NULL, &JsValue::from_str(text));
         });
+        self.put(agent);
+        Ok(())
+    }
+
+    /// With `off` true, asks a Qwen3-style model not to think (the prompt
+    /// ends with the empty thinking block); false renders as the model's
+    /// template does by default.
+    #[wasm_bindgen(js_name = setThinkingOff)]
+    pub fn set_thinking_off(&self, off: bool) -> Result<(), JsError> {
+        let mut agent = self.take()?;
+        agent.set_thinking(if off {
+            Thinking::Off
+        } else {
+            Thinking::TemplateDefault
+        });
+        self.put(agent);
+        Ok(())
+    }
+
+    /// Caps a thinking block at `cap` tokens, 0 for no cap.
+    #[wasm_bindgen(js_name = setThinkCap)]
+    pub fn set_think_cap(&self, cap: u32) -> Result<(), JsError> {
+        let mut agent = self.take()?;
+        agent.set_think_cap((cap > 0).then_some(cap as usize));
         self.put(agent);
         Ok(())
     }
