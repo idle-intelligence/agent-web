@@ -182,3 +182,181 @@ Full per-case reports (reasons, retries, tokens, times):
   same configuration, on a different machine and engine build, with other
   jobs running (load averages above). They show the order of magnitude on the
   M2 laptop, not a comparison of the two GPUs.
+
+## Thinking off, clear prompt
+
+Same harness and parameters as above, with `--thinking off`: the prompt
+ends with Qwen3's empty thinking block, so the model answers or calls tools
+without reasoning first. Clear system prompt, greedy, `max_new_tokens` 1024,
+`max_steps` 6, `max_ctx` 4096, backend `webgpu` (native, Metal) in every
+run. The binary was built from llm-web `browser-perf` at cc92176 (no
+tracked edits at build time) through the same local `cargo --config`
+patch; the thinking-on columns are the runs above, built at 572925e. The
+report now also lists the calls made and the final answer of each failed
+case.
+
+| run | load at start | load at end |
+|---|---|---|
+| Sonos clear, Qwen3-1.7B, thinking off | 1.61 2.22 2.99 | 2.52 2.21 2.60 |
+| two-step clear, Qwen3-1.7B, thinking off | 2.52 2.21 2.60 | 2.35 2.20 2.58 |
+| Sonos clear, Qwen3-1.7B, thinking on, 9 cases | 2.35 2.20 2.58 | 3.45 3.07 2.82 |
+| Sonos clear, Qwen3-0.6B, thinking off | 2.76 2.94 2.78 | 2.67 2.44 2.55 |
+| two-step clear, Qwen3-0.6B, thinking off | 2.67 2.44 2.55 | 3.69 2.66 2.63 |
+
+### Pass rate
+
+Sonos set, 33 scored cases:
+
+| family (cases) | 1.7B clear, thinking on | 1.7B clear, thinking off | 0.6B clear, thinking off |
+|---|---|---|---|
+| single (14) | 9/14 | 4/14 | 1/14 |
+| multi (17) | 11/17 | 0/17 | 0/17 |
+| multi-fr (2) | 1/2 | 0/2 | 0/2 |
+| all (33) | 21/33 = 63.6% | 4/33 = 12.1% | 1/33 = 3.0% |
+
+Two-step set, 8 cases:
+
+| run | 1.7B, thinking on | 1.7B, thinking off | 0.6B, thinking off |
+|---|---|---|---|
+| clear | 6/8 = 75.0% | 2/8 = 25.0% | 2/8 = 25.0% |
+
+### Per case
+
+| id | 1.7B clear, thinking on | 1.7B clear, thinking off | 0.6B clear, thinking off |
+|---|---|---|---|
+| s01 | fail | fail | fail |
+| s02 | pass | pass | fail |
+| s03 | fail | fail | fail |
+| s06 | pass | fail | fail |
+| s07 | pass | fail | fail |
+| s08 | pass | fail | fail |
+| s09 | pass | fail | fail |
+| m01 | pass | fail | fail |
+| m02 | pass | fail | fail |
+| m03 | pass | fail | fail |
+| m04 | pass | fail | fail |
+| m05 | pass | fail | fail |
+| m07 | pass | fail | fail |
+| m08 | fail | fail | fail |
+| m09 | pass | fail | fail |
+| m11 | pass | fail | fail |
+| s11 | pass | pass | fail |
+| s13 | pass | fail | fail |
+| s14 | fail | pass | fail |
+| s15 | fail | fail | fail |
+| s16 | fail | fail | fail |
+| s17 | pass | fail | fail |
+| m13 | pass | fail | fail |
+| m20 | fail | fail | fail |
+| m21 | fail | fail | fail |
+| m22 | fail | fail | fail |
+| m23 | fail | fail | fail |
+| m24 | pass | fail | fail |
+| m25 | pass | fail | fail |
+| m26 | fail | fail | fail |
+| m27 | fail | fail | fail |
+| m28 | pass | fail | fail |
+| s18 | pass | pass | pass |
+| t01 | fail | pass | pass |
+| t02 | pass | pass | pass |
+| t03 | pass | fail | fail |
+| t04 | pass | fail | fail |
+| t05 | pass | fail | fail |
+| t06 | fail | fail | fail |
+| t07 | pass | fail | fail |
+| t08 | pass | fail | fail |
+
+### Tokens and time per step
+
+Means over all steps of the scored cases; the thinking-on rows are the
+clear rows of the table above.
+
+| run | steps | prompt_tok | think_tok | answer_tok | first_token_s | decode_s | total_s | decode tok/s |
+|---|---|---|---|---|---|---|---|---|
+| Sonos clear, 1.7B, thinking on | 91 | 2659.8 | 411.7 | 37.8 | 1.860 | 21.663 | 23.523 | 20.8 |
+| Sonos clear, 1.7B, thinking off | 68 | 2322.7 | 0.0 | 33.0 | 0.869 | 1.226 | 2.095 | 26.9 |
+| Sonos clear, 0.6B, thinking off | 60 | 2232.4 | 0.0 | 21.4 | 0.474 | 0.511 | 0.985 | 41.9 |
+| two-step clear, 1.7B, thinking on | 20 | 582.2 | 210.8 | 26.9 | 0.648 | 9.069 | 9.717 | 26.2 |
+| two-step clear, 1.7B, thinking off | 12 | 531.7 | 0.0 | 25.7 | 0.403 | 0.743 | 1.146 | 34.6 |
+| two-step clear, 0.6B, thinking off | 15 | 528.3 | 0.0 | 20.7 | 0.427 | 0.527 | 0.954 | 39.3 |
+
+Per case:
+
+| run | steps per case | mean_total_s | retries | tool errors |
+|---|---|---|---|---|
+| Sonos clear, 1.7B, thinking on | 2.76 | 69.81 | 7 | 0 |
+| Sonos clear, 1.7B, thinking off | 2.09 | 4.32 | 0 | 0 |
+| Sonos clear, 0.6B, thinking off | 1.82 | 1.80 | 0 | 0 |
+| two-step clear, 1.7B, thinking on | 2.50 | 24.30 | 1 | 1 |
+| two-step clear, 1.7B, thinking off | 1.50 | 1.72 | 0 | 1 |
+| two-step clear, 0.6B, thinking off | 1.88 | 1.81 | 0 | 3 |
+
+### The nine Sonos cases that fail in every configuration
+
+m08, m21, m22, m23, m26, m27, s14, s15 and s16 fail in all four thinking-on
+configurations above (10-08 and now, default and clear prompts, and the
+capped run). They were run again with Qwen3-1.7B, clear prompt, thinking
+on, on the cc92176 build, to record the calls and the answers; 8 of the 9
+reproduce the earlier clear run's token counts exactly, and m08 differs
+(4 steps and 5203 thinking tokens against 5 steps and 7447). The fixture
+returns one canned result per tool whatever the arguments (`pause` always
+reports the kitchen group as paused, `set_group_volume` always reports
+volume 35, `get_now_playing` always reports the kitchen group playing
+Radiohead). Data: `sonos-clear-nine-failing-rerun.md`.
+
+| id | utterance | required by the case | calls made (thinking on, clear) | final answer, shortened |
+|---|---|---|---|---|
+| m08 | Turn up the kitchen volume by 10. | `adjust_group_volume(KITCHEN, +10)` | households, `set_group_volume(KITCHEN, 10)`, `set_group_volume(KITCHEN, 45)` | "The kitchen volume has been set to 45." |
+| s14 | What's on in the bedroom? | `get_now_playing(BEDROOM)` | households | "The bedroom is currently idle, meaning no music is playing" |
+| s15 | Is anything playing? | `get_now_playing(LIVING)` | `get_now_playing("default")` | "Yes, something is playing on RINCON_KITCHEN01:1 ... Radiohead" |
+| s16 | Turn it down a bit. | `adjust_group_volume(LIVING, -10)` | households, `adjust_group_volume(LIVING, -5)` | "The volume for the Kitchen group ... adjusted down by 5" |
+| m21 | Pause the garage. | no mutating call, text answer | `pause("garage")` | "The garage group (identified as RINCON_KITCHEN01:1) has been paused." |
+| m22 | Play something. | any `play_*` call with a valid group id | none | asks for an artist, a favorite or a station |
+| m23 | Pause the kitchen and turn up the bedroom. | `pause(KITCHEN)`, then `adjust_group_volume(BEDROOM, +10)` | households, `pause(KITCHEN)`, `set_group_volume(BEDROOM, 50)`, `set_group_volume(BEDROOM, 60)` | "the bedroom's volume has been adjusted to 60%" |
+| m26 | Monte le son du salon. | `adjust_group_volume(LIVING, +10)` | households | "The living room ... is currently playing music. Would you like to adjust the volume ...?" |
+| m27 | Play nirvana on BLOUPBLIP. | `play_artist(KITCHEN, "Nirvana", false)` | `play_artist(BLOUPBLIP, "Nirvana", false)` | "The group RINCON_KITCHEN01:1 is now playing Nirvana." |
+
+KITCHEN, LIVING and BEDROOM stand for `RINCON_KITCHEN01:1`,
+`RINCON_LIVING01:2` and `RINCON_BEDROOM01:3`; "households" is
+`get_households_and_groups_and_players({})`.
+
+### Observations
+
+- Thinking off cuts the Sonos pass rate of Qwen3-1.7B from 21/33 to 4/33
+  and the two-step one from 6/8 to 2/8 on the clear prompt. No multi-step
+  Sonos case passes without thinking (0/17 and 0/2 French).
+- Without thinking the model mostly skips the discovery call: 18 of the
+  29 failed Sonos cases (1.7B) use a group id that is not in the household
+  (`"kitchen"`, `"your_group_id"`, `"living room"`), and only 3 of the 29
+  call `get_households_and_groups_and_players`. On the two-step set it
+  calls `get_weather({"city":"here"})` after `get_location` (t03, t05) and
+  `set_volume` with a room name instead of the listed id (t07). For 0.6B
+  the figures are 26 of 32 Sonos failures with an invented id and none
+  with the lookup.
+- 7 of the 29 failed Sonos cases (1.7B, thinking off) end in text with no
+  call, several of them announcing the call instead of making it (s15
+  "Let me call the `get_now_playing` function", s17, m07). t04, t06 and t08
+  end the same way on the two-step set.
+- The two cases that pass only with thinking off, s14 and t01, are cases
+  where thinking on answers without a tool (s14 from the household listing,
+  t01 by declining arithmetic); without thinking, s14 calls
+  `get_now_playing(BEDROOM)` and t01 answers with 4.
+- A thinking-off step costs 2.10 s against 23.52 s with thinking on
+  (Sonos, 1.7B), and a case 4.32 s against 69.81 s. Time to the first piece
+  drops from 1.86 s to 0.87 s per step and decode from 21.66 s to 1.23 s,
+  since the step generates 33.0 tokens instead of 449.5. The thinking-on
+  and thinking-off runs used different engine builds (572925e and
+  cc92176) under similar load averages.
+- Qwen3-0.6B with thinking off takes 0.99 s per step and 1.80 s per case on
+  the Sonos set and passes 1/33 (s18, the case that needs no call) and 2/8
+  on the two-step set.
+- Of the nine cases that fail everywhere with thinking on, the calls show
+  the following. m08 and m23 use `set_group_volume` for a relative
+  change, with values not read from any tool. s16 makes the expected call
+  with a delta of -5 where the case requires -10. m21, s15 and m27 use a
+  group id absent from the household (`"garage"`, `"default"`,
+  `"BLOUPBLIP"`), and the canned fixture result reports success on the
+  kitchen group, which the answers repeat. s14 answers from the household
+  listing ("idle") without `get_now_playing`, m22 asks what to play, and
+  m26 looks the room up and then asks what to do instead of raising the
+  volume.
