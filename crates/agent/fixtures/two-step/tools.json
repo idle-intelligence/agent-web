@@ -1,0 +1,59 @@
+[
+  {
+    "name": "get_location",
+    "description": "Get the user's current city and country. Call this when a request refers to the user's location (\"here\", \"where I am\") without naming a place.",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    }
+  },
+  {
+    "name": "get_weather",
+    "description": "Get the current weather for a city.",
+    "inputSchema": {
+      "properties": {
+        "city": {
+          "description": "The city to get the weather for.",
+          "type": "string"
+        },
+        "unit": {
+          "description": "Temperature unit. Defaults to celsius.",
+          "enum": ["celsius", "fahrenheit"],
+          "type": "string"
+        }
+      },
+      "required": ["city"],
+      "type": "object"
+    }
+  },
+  {
+    "name": "list_rooms",
+    "description": "List the rooms with a speaker, each with its room ID and name. Call this before set_volume if you don't already know the room's ID from this conversation.",
+    "inputSchema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    }
+  },
+  {
+    "name": "set_volume",
+    "description": "Set the speaker volume in a room to an exact level.",
+    "inputSchema": {
+      "properties": {
+        "room_id": {
+          "description": "The room's ID, from list_rooms.",
+          "type": "string"
+        },
+        "level": {
+          "description": "Volume level, 0-100.",
+          "maximum": 100,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": ["room_id", "level"],
+      "type": "object"
+    }
+  }
+]

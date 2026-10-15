@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io;
 
-pub use crate::generator::{AbortFlag, GenerateError, Generator};
 use crate::generator::now_ms;
+pub use crate::generator::{AbortFlag, GenerateError, Generator};
 pub use lean_chat::{ChatTemplate, Message};
 
 // ---------------------------------------------------------------------
@@ -452,7 +452,8 @@ impl StepTiming {
         (self.total_ms - self.first_token_ms).max(0.0)
     }
 
-    fn add(&mut self, other: &StepTiming) {
+    /// Adds `other` into `self`.
+    pub fn add(&mut self, other: &StepTiming) {
         self.prompt_tokens += other.prompt_tokens;
         self.think_tokens += other.think_tokens;
         self.answer_tokens += other.answer_tokens;
@@ -1809,10 +1810,7 @@ mod tests {
         ]);
         let prompts = generator.prompts();
         let mut agent = qwen3_agent(generator);
-        assert!(matches!(
-            start(&mut agent),
-            StepOutcome::NeedTools { .. }
-        ));
+        assert!(matches!(start(&mut agent), StepOutcome::NeedTools { .. }));
         assert!(matches!(
             provide(&mut agent, sunny()),
             StepOutcome::Final { .. }
@@ -1869,7 +1867,9 @@ mod tests {
 
     #[test]
     fn the_cap_leaves_a_block_that_closed_by_itself() {
-        let generator = FakeGenerator::script(&["<think>\none two three four five six\n</think>\n\nIt is sunny."]);
+        let generator = FakeGenerator::script(&[
+            "<think>\none two three four five six\n</think>\n\nIt is sunny.",
+        ]);
         let budgets = generator.budgets();
         let mut agent = qwen3_agent(generator);
         agent.set_think_cap(Some(8));
@@ -1882,7 +1882,8 @@ mod tests {
 
     #[test]
     fn the_cap_does_not_cut_a_reply_that_never_thinks() {
-        let generator = FakeGenerator::script(&["one two three four five six seven eight nine ten"]);
+        let generator =
+            FakeGenerator::script(&["one two three four five six seven eight nine ten"]);
         let budgets = generator.budgets();
         let mut agent = qwen3_agent(generator);
         agent.set_think_cap(Some(8));
