@@ -360,3 +360,114 @@ KITCHEN, LIVING and BEDROOM stand for `RINCON_KITCHEN01:1`,
   listing ("idle") without `get_now_playing`, m22 asks what to play, and
   m26 looks the room up and then asks what to do instead of raising the
   volume.
+
+## Server-like fixture and corrected scoring
+
+The Sonos fixture and five cases' scoring were changed, and the three
+thinking-on Sonos configurations were run again. These scores are not
+comparable to the earlier runs in this log: the fixture now answers
+differently (the model sees different tool results), and five cases are
+scored differently. The "before" columns below are the runs above, on the
+old fixture and scoring; they are listed to show which cases changed, not
+as a baseline.
+
+Fixture changes (`crates/agent/fixtures/sonos/README.md`):
+
+- A call naming a group or player id that the household listing does not
+  have returns an error result (`group "garage" not found in household
+  Sonos_ABC123XYZ`) instead of the canned success on the kitchen group.
+- `get_now_playing` answers per group, matching each group's
+  `playbackState` in the listing: Kitchen paused on the Radiohead track,
+  Living Room playing, Bedroom idle with no current item. It used to report
+  the kitchen group playing Radiohead for any argument.
+
+Scoring changes (`eval/utterances.json`):
+
+| id | before | now |
+|---|---|---|
+| m27 | `play_artist(KITCHEN, "Nirvana", false)` required | no mutating call and a text answer, as m21 |
+| s14 | `get_now_playing(BEDROOM)` required | that, or the household lookup and an answer containing "idle", "nothing", "not playing", "no music" or "isn't playing" |
+| s16 | `adjust_group_volume(LIVING, -10)` | `adjust_group_volume(LIVING, d)` with -20 <= d <= -1 |
+| m23 | `pause(KITCHEN)`, then `adjust_group_volume(BEDROOM, +10)` | the same with 1 <= d <= 20 |
+| m26 | `adjust_group_volume(LIVING, +10)` | `adjust_group_volume(LIVING, d)` with 1 <= d <= 20 |
+| m22 | any `play_*` call with a valid group id | that, or no mutating call and an answer containing a question mark |
+
+### Parameters
+
+Same as the thinking-on runs above (Qwen3-1.7B Q8_0, thinking on, greedy,
+`max_new_tokens` 1024, `max_steps` 6, `max_ctx` 4096, 33 scored cases, the
+13-tool subset), with these differences:
+
+| parameter | value |
+|---|---|
+| agent-web | bcf446b (fixture and scoring changes) |
+| engine source | llm-web `browser-perf` at 1199050 through the same local `cargo --config` patch of `lean`, `lean-core` and `lean-chat`; no tracked edits at build time. 1199050 differs from cc92176 by one run document, so the engine code is that of cc92176 |
+| backend | `webgpu` (native, Metal) in all three runs, from the binary's `backend:` line |
+| runs | one after the other, each started when the 1-minute load average was below 3 and no rustc or cargo was running, under the GPU lock |
+
+| run | load at start | load at end |
+|---|---|---|
+| Sonos default | 2.60 3.81 3.49 | 1.17 2.53 2.84 |
+| Sonos clear | 1.17 2.53 2.84 | 1.23 1.17 1.32 |
+| Sonos clear, cap 512 | 1.23 1.17 1.32 | 1.08 1.07 1.09 |
+
+### Pass rate
+
+| family (cases) | default, before | default, now | clear, before | clear, now | clear cap 512, before | clear cap 512, now |
+|---|---|---|---|---|---|---|
+| single (14) | 9/14 | 11/14 | 9/14 | 11/14 | 10/14 | 12/14 |
+| multi (17) | 9/17 | 10/17 | 11/17 | 12/17 | 12/17 | 13/17 |
+| multi-fr (2) | 1/2 | 1/2 | 1/2 | 1/2 | 1/2 | 1/2 |
+| all (33) | 19/33 = 57.6% | 22/33 = 66.7% | 21/33 = 63.6% | 24/33 = 72.7% | 23/33 = 69.7% | 26/33 = 78.8% |
+
+### Cases whose outcome changed
+
+The same three cases, fail to pass, in each of the three configurations; no
+case went from pass to fail.
+
+| id | default | clear | clear, cap 512 | reason given by the scorer now |
+|---|---|---|---|---|
+| s14 | fail to pass | fail to pass | fail to pass | lookup made, answer says idle or nothing playing (the alternative) |
+| s16 | fail to pass | fail to pass | fail to pass | `adjust_group_volume(LIVING, d)` with d in the accepted range |
+| m22 | fail to pass | fail to pass | fail to pass | no mutating call, answer asks what to play (the alternative) |
+
+### Tokens and time per step
+
+| run | steps | prompt_tok | think_tok | answer_tok | first_token_s | decode_s | total_s | steps per case | mean_total_s | retries | tool errors |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Sonos default | 90 | 2828.5 | 493.2 | 40.4 | 1.863 | 23.561 | 25.424 | 2.73 | 69.35 | 12 | 1 |
+| Sonos clear | 93 | 2686.9 | 418.4 | 39.1 | 1.770 | 18.978 | 20.748 | 2.85 | 62.55 | 7 | 3 |
+| Sonos clear, cap 512 | 94 | 2730.5 | 351.2 | 41.0 | 1.794 | 15.838 | 17.633 | 2.85 | 50.24 | 8 | 3 |
+
+Tool errors by case: default, m27; clear, s15, m21 and m27; clear with cap
+512, m08, m21 and m27. Each is a call with an id outside the household
+(`"BLOUPBLIP"`, `"garage"`, `"default"`, `"kitchen"`), which the old
+fixture answered with a success.
+
+Data: `sonos-default-server-fixture.md`, `sonos-clear-server-fixture.md`,
+`sonos-clear-cap512-server-fixture.md`.
+
+### Observations
+
+- All three outcome changes, in all three configurations, come from the
+  scoring changes (s14, s16, m22 pass through the new alternatives and
+  range); the fixture change did not turn any case from fail to pass or
+  from pass to fail. Totals rise by exactly 3 in each configuration: 19 to
+  22, 21 to 24, 23 to 26 of 33.
+- m27 still fails in all three runs, now against the no-mutation rule:
+  the model calls `play_artist` on `"BLOUPBLIP"` first, gets the
+  not-found error, then looks the household up and answers that the speaker
+  does not exist and lists the three groups. The scorer counts the rejected
+  call as a mutating call. m21 does the same with `pause("garage")` in
+  the clear and capped runs; in the default run it pauses the living room
+  after the lookup.
+- With the error results, the final answers of m21, m27 and s15 no longer
+  repeat a success on the kitchen group: m21 and m27 report that the room
+  was not found, and s15 (clear) calls `get_now_playing("default")`, gets
+  the error, calls the household listing and answers that the living room
+  is playing. s15 still fails, since it never calls
+  `get_now_playing(LIVING)`.
+- m23 and m26 still fail with the 1 to 20 range: m23 uses
+  `set_group_volume` on the bedroom (70, 50 then 60, and 50 in the three
+  runs), and m26 looks the room up and asks what to do without a volume
+  call. m08 still uses `set_group_volume` for "by 10".
