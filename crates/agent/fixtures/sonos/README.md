@@ -63,8 +63,21 @@ the full schemas.
 
 ## `results/`
 
-One canned JSON file per tool, `results/<tool>.json`: the bare value that
-call returns against the fixture household (one Kitchen, Living Room and
-Bedroom group each), the same for any arguments. `agent::eval::FixtureCaller`
-returns it as is; the agent reads a result with a top-level non-null
-`error` field, or an MCP result with `isError: true`, as a tool error.
+One JSON file per tool, `results/<tool>.json`: the bare value that call
+returns against the fixture household (one Kitchen, Living Room and
+Bedroom group each). `agent::eval::FixtureCaller` serves it the way the
+a real server answers:
+
+- A call whose `group_id`, `source_group_id`, `player_id`, `player_ids` or
+  `destination_player_ids` names a group or player the household listing
+  does not have returns `{"error": "group \"<id>\" not found in household
+  Sonos_ABC123XYZ"}` (or `player ...`). The wording is the fixture's own.
+- A file of the form `{"by_group_id": {"<groupId>": <result>, ...}}`
+  answers with the entry of the call's `group_id`. `get_now_playing.json`
+  is one: Kitchen is paused on a Radiohead track, Living Room is playing,
+  Bedroom is idle with no current item, matching each group's
+  `playbackState` in the listing.
+- Every other file is returned as is, the same for any valid arguments.
+
+The agent reads a result with a top-level non-null `error` field, or an
+MCP result with `isError: true`, as a tool error.

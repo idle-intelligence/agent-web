@@ -143,13 +143,81 @@ impl FixtureCaller {
     }
 }
 
-impl ToolCaller for FixtureCaller {
-    fn call(&mut self, name: &str, args: &Value) -> Result<Value> {
-        self.calls_seen.push((name.to_string(), args.clone()));
+const HOUSEHOLDS_TOOL: &str = "get_households_and_groups_and_players";
+
+impl FixtureCaller {
+    fn read_result(&self, name: &str) -> Result<Value> {
         let path = self.results_dir.join(format!("{name}.json"));
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading fixture result {path:?}"))?;
         Ok(serde_json::from_str(&text)?)
+    }
+
+    /// The first group or player id in `args` that the fixture household
+    /// does not have, as the error a server would return for it.
+    fn unknown_id_error(&self, args: &Value) -> Result<Option<Value>> {
+        let households = self.read_result(HOUSEHOLDS_TOOL)?;
+        let household = &households["households"][0];
+        let ids = |list: &str, key: &str| -> Vec<String> {
+            household[list]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v[key].as_str().map(str::to_string))
+                .collect()
+        };
+        let groups = ids("groups", "groupId");
+        let players = ids("players", "playerId");
+        let household_id = household["householdId"].as_str().unwrap_or("");
+        let checks: [(&str, &[String], &str); 5] = [
+            ("group_id", &groups, "group"),
+            ("source_group_id", &groups, "group"),
+            ("player_id", &players, "player"),
+            ("player_ids", &players, "player"),
+            ("destination_player_ids", &players, "player"),
+        ];
+        for (key, known, what) in checks {
+            let given: Vec<&Value> = match args.get(key) {
+                Some(Value::Array(items)) => items.iter().collect(),
+                Some(v) => vec![v],
+                None => continue,
+            };
+            for v in given {
+                let id = v
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string());
+                if !known.contains(&id) {
+                    return Ok(Some(serde_json::json!({
+                        "error": format!("{what} {id:?} not found in household {household_id}")
+                    })));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Serves `<results_dir>/<tool>.json` like the Sonos MCP server would: a
+/// group or player id that the fixture household does not have gets an
+/// `error` result, and a result file of the form `{"by_group_id": {...}}`
+/// answers with the entry of the call's `group_id`.
+impl ToolCaller for FixtureCaller {
+    fn call(&mut self, name: &str, args: &Value) -> Result<Value> {
+        self.calls_seen.push((name.to_string(), args.clone()));
+        if let Some(error) = self.unknown_id_error(args)? {
+            return Ok(error);
+        }
+        let result = self.read_result(name)?;
+        match result.get("by_group_id") {
+            Some(by_group) => {
+                let group = args.get("group_id").and_then(Value::as_str).unwrap_or("");
+                by_group.get(group).cloned().with_context(|| {
+                    format!("fixture result {name}.json has no entry for group {group:?}")
+                })
+            }
+            None => Ok(result),
+        }
     }
 }
 
@@ -969,6 +1037,67 @@ mod tests {
         assert_eq!(result.steps, 3);
         assert_eq!(result.calls_made.len(), 2);
         assert_eq!(result.tool_errors, 0);
+    }
+
+    #[test]
+    fn fixture_caller_rejects_ids_absent_from_the_household() {
+        let mut caller = FixtureCaller::new(format!("{}/results", fixtures_dir()));
+        let paused = caller
+            .call("pause", &json!({"group_id": "RINCON_KITCHEN01:1"}))
+            .unwrap();
+        assert!(paused.get("error").is_none(), "{paused}");
+        for (name, args) in [
+            ("pause", json!({"group_id": "garage"})),
+            (
+                "play_artist",
+                json!({"group_id": "BLOUPBLIP", "artist": "Nirvana"}),
+            ),
+            ("get_now_playing", json!({"group_id": "RINCON_KITCHEN02"})),
+            (
+                "set_player_mute",
+                json!({"player_id": "RINCON_KITCHEN01:1", "muted": true}),
+            ),
+            (
+                "add_players_to_group",
+                json!({"group_id": "RINCON_KITCHEN01:1", "player_ids": ["RINCON_BEDROOM01", "nope"]}),
+            ),
+        ] {
+            let result = caller.call(name, &args).unwrap();
+            let error = result["error"].as_str().unwrap_or_default();
+            assert!(error.contains("not found in household"), "{name}: {result}");
+        }
+        let listing = caller.call(HOUSEHOLDS_TOOL, &json!({})).unwrap();
+        assert!(listing.get("error").is_none());
+        assert_eq!(caller.calls_seen().len(), 7);
+    }
+
+    #[test]
+    fn fixture_caller_answers_now_playing_per_group() {
+        let mut caller = FixtureCaller::new(format!("{}/results", fixtures_dir()));
+        let households = households();
+        for group in households["households"][0]["groups"].as_array().unwrap() {
+            let id = group["groupId"].as_str().unwrap();
+            let now = caller
+                .call("get_now_playing", &json!({ "group_id": id }))
+                .unwrap();
+            assert_eq!(now["groupId"], id);
+            assert_eq!(now["playbackState"], group["playbackState"], "{id}");
+        }
+        let bedroom = caller
+            .call(
+                "get_now_playing",
+                &json!({"group_id": "RINCON_BEDROOM01:3"}),
+            )
+            .unwrap();
+        assert!(bedroom.get("currentItem").is_none());
+        let kitchen = caller
+            .call(
+                "get_now_playing",
+                &json!({"group_id": "RINCON_KITCHEN01:1"}),
+            )
+            .unwrap();
+        assert_eq!(kitchen["currentItem"]["track"]["artist"], "Radiohead");
+        assert!(caller.call("get_now_playing", &json!({})).is_err());
     }
 
     fn two_step_cases() -> Vec<EvalCase> {
