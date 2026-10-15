@@ -15,6 +15,7 @@ type Reply = Box<dyn FnMut(&str) -> Result<String, GenerateError>>;
 pub(crate) struct FakeGenerator {
     reply: Reply,
     prompts: Rc<RefCell<Vec<String>>>,
+    budgets: Rc<RefCell<Vec<usize>>>,
 }
 
 impl FakeGenerator {
@@ -22,6 +23,7 @@ impl FakeGenerator {
         Self {
             reply: Box::new(reply),
             prompts: Rc::default(),
+            budgets: Rc::default(),
         }
     }
 
@@ -35,6 +37,11 @@ impl FakeGenerator {
         })
     }
 
+    /// The `max_new_tokens` of every call so far, shared with the generator.
+    pub(crate) fn budgets(&self) -> Rc<RefCell<Vec<usize>>> {
+        self.budgets.clone()
+    }
+
     /// Every prompt generated from so far, shared with the generator.
     pub(crate) fn prompts(&self) -> Rc<RefCell<Vec<String>>> {
         self.prompts.clone()
@@ -45,7 +52,7 @@ impl Generator for FakeGenerator {
     fn generate(
         &mut self,
         prompt: &str,
-        _max_new_tokens: usize,
+        max_new_tokens: usize,
         on_text: &mut dyn FnMut(&str),
         abort: &AbortFlag,
     ) -> impl std::future::Future<Output = Result<String, GenerateError>> {
@@ -53,6 +60,7 @@ impl Generator for FakeGenerator {
             Err(GenerateError::Aborted)
         } else {
             self.prompts.borrow_mut().push(prompt.to_string());
+            self.budgets.borrow_mut().push(max_new_tokens);
             match (self.reply)(prompt) {
                 Ok(text) => {
                     on_text(&text);
@@ -66,5 +74,10 @@ impl Generator for FakeGenerator {
             }
         };
         std::future::ready(reply)
+    }
+
+    /// One token per whitespace-separated word.
+    fn count_tokens(&self, text: &str) -> Option<usize> {
+        Some(text.split_whitespace().count())
     }
 }

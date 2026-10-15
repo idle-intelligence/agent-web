@@ -14,6 +14,7 @@ use serde_json::Value;
 use std::io;
 
 pub use crate::generator::{AbortFlag, GenerateError, Generator};
+use crate::generator::now_ms;
 pub use lean_chat::{ChatTemplate, Message};
 
 // ---------------------------------------------------------------------
@@ -193,8 +194,55 @@ fn call_arguments(name: &str, arguments: Option<Value>) -> Result<Value, String>
     }
 }
 
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+/// A reply split into its thinking block and what follows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitReply<'a> {
+    /// The reasoning, without the `<think>` and `</think>` tags, trimmed.
+    /// `None` when the reply has no thinking block.
+    pub thinking: Option<&'a str>,
+    /// What follows the closing tag (the whole reply when there is no
+    /// thinking block). Empty while the block is still open.
+    pub answer: &'a str,
+    /// The reply opened a thinking block and ended before closing it.
+    pub unclosed: bool,
+}
+
+/// Splits `raw` at the end of a leading thinking block, the way Qwen3
+/// writes it: `<think>\nreasoning\n</think>\n\nanswer`. A reply with a
+/// `</think>` but no `<think>` (a template that opens the block in the
+/// prompt) is split the same way.
+pub fn split_thinking(raw: &str) -> SplitReply<'_> {
+    if let Some(close) = raw.find(THINK_CLOSE) {
+        let head = raw[..close].trim_start();
+        let head = head.strip_prefix(THINK_OPEN).unwrap_or(head);
+        return SplitReply {
+            thinking: Some(head.trim()),
+            answer: &raw[close + THINK_CLOSE.len()..],
+            unclosed: false,
+        };
+    }
+    if let Some(rest) = raw.trim_start().strip_prefix(THINK_OPEN) {
+        return SplitReply {
+            thinking: Some(rest.trim()),
+            answer: "",
+            unclosed: true,
+        };
+    }
+    SplitReply {
+        thinking: None,
+        answer: raw,
+        unclosed: false,
+    }
+}
+
 /// Parse one turn of raw (decoded) model output.
 ///
+/// - A leading `<think>...</think>` block is dropped first (see
+///   [`split_thinking`]); a reply that ends inside the block is an error.
+///   Tool calls written inside the reasoning are not calls.
 /// - A trailing `<|im_end|>` (and whitespace before it) is stripped first.
 /// - Every `<tool_call>...</tool_call>` block found is parsed as one call;
 ///   a block whose contents don't parse as `{"name", "arguments"}` is an
@@ -202,7 +250,14 @@ fn call_arguments(name: &str, arguments: Option<Value>) -> Result<Value, String>
 /// - With no `<tool_call>` block at all, the (trimmed) text is the plain
 ///   answer.
 pub fn parse_output(raw: &str) -> Result<ParsedOutput, String> {
-    let trimmed = raw.trim();
+    let split = split_thinking(raw);
+    if split.unclosed {
+        return Err(format!(
+            "reply ended inside the thinking block ({} bytes of reasoning, no {THINK_CLOSE})",
+            split.thinking.map_or(0, str::len)
+        ));
+    }
+    let trimmed = split.answer.trim();
     let without_end = trimmed.strip_suffix("<|im_end|>").unwrap_or(trimmed).trim();
 
     const OPEN: &str = "<tool_call>";
@@ -351,6 +406,62 @@ pub struct PendingToolCall {
     pub arguments: Value,
 }
 
+/// How the agent treats a Qwen3-style thinking block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Thinking {
+    /// Render as the template does by default: the model thinks first, if
+    /// its template lets it.
+    #[default]
+    TemplateDefault,
+    /// Ask for no thinking: the prompt ends with the empty block
+    /// `<think>\n\n</think>\n\n`, which is what Qwen3's template adds for
+    /// `enable_thinking=false`. Only for templates that have that switch.
+    Off,
+}
+
+/// The empty thinking block Qwen3's template appends to the generation
+/// prompt when `enable_thinking` is false.
+const EMPTY_THINK_BLOCK: &str = "<think>\n\n</think>\n\n";
+
+/// What closes a thinking block that hit the cap.
+const FORCED_THINK_CLOSE: &str = "\n</think>\n\n";
+
+/// Token and time accounting of one step, summed over the step's attempts
+/// (retries included). Token counts need [`Generator::count_tokens`] and
+/// are 0 without it; times are 0 on wasm32 (no monotonic clock).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct StepTiming {
+    /// Tokens of the prompts, summed over the attempts.
+    pub prompt_tokens: usize,
+    /// Tokens of the thinking blocks, tags included.
+    pub think_tokens: usize,
+    /// Tokens after the thinking blocks: the answer or the tool calls.
+    pub answer_tokens: usize,
+    /// Time of the `generate` calls, in milliseconds.
+    pub total_ms: f64,
+    /// Time from the start of each call to its first streamed piece:
+    /// prefill plus the first token.
+    pub first_token_ms: f64,
+    /// A thinking block hit the cap and was closed by the agent.
+    pub think_capped: bool,
+}
+
+impl StepTiming {
+    /// Time after the first piece of each call: the rest of the decode.
+    pub fn decode_ms(&self) -> f64 {
+        (self.total_ms - self.first_token_ms).max(0.0)
+    }
+
+    fn add(&mut self, other: &StepTiming) {
+        self.prompt_tokens += other.prompt_tokens;
+        self.think_tokens += other.think_tokens;
+        self.answer_tokens += other.answer_tokens;
+        self.total_ms += other.total_ms;
+        self.first_token_ms += other.first_token_ms;
+        self.think_capped |= other.think_capped;
+    }
+}
+
 /// One render -> generate -> parse round of the agent loop.
 #[derive(Debug)]
 pub struct Step {
@@ -369,6 +480,7 @@ pub struct Step {
     pub repeat_guard: bool,
     /// The step ended with the model asked for a plain-text answer.
     pub forced_text_answer: bool,
+    pub timing: StepTiming,
 }
 
 #[derive(Debug)]
@@ -412,6 +524,7 @@ struct AttemptOutput {
     prompt: String,
     generated_text: String,
     parsed: std::result::Result<ParsedOutput, String>,
+    timing: StepTiming,
 }
 
 /// Why a reply was not accepted.
@@ -448,6 +561,8 @@ pub struct Agent<G: Generator> {
     max_steps: usize,
     max_retries: usize,
     max_result_chars: usize,
+    thinking: Thinking,
+    think_cap: Option<usize>,
     abort: AbortFlag,
     on_text: Box<dyn FnMut(&str)>,
 
@@ -476,6 +591,8 @@ impl<G: Generator> Agent<G> {
             max_steps: DEFAULT_MAX_STEPS,
             max_retries: DEFAULT_MAX_RETRIES,
             max_result_chars: MAX_RESULT_CHARS,
+            thinking: Thinking::default(),
+            think_cap: None,
             abort: AbortFlag::new(),
             on_text: Box::new(|_| {}),
             messages: Vec::new(),
@@ -510,6 +627,20 @@ impl<G: Generator> Agent<G> {
     /// large. Default [`MAX_RESULT_CHARS`].
     pub fn set_max_result_chars(&mut self, max_result_chars: usize) {
         self.max_result_chars = max_result_chars;
+    }
+
+    /// Whether the model is asked to think; see [`Thinking`].
+    pub fn set_thinking(&mut self, thinking: Thinking) {
+        self.thinking = thinking;
+    }
+
+    /// Caps a thinking block at `cap` tokens. When a reply is still inside
+    /// its block after `cap` tokens, the agent closes the block itself
+    /// (`\n</think>\n\n`) and generates the rest from there, with the
+    /// remaining `max_new_tokens` budget. Needs
+    /// [`Generator::count_tokens`]; without it there is no cap.
+    pub fn set_think_cap(&mut self, cap: Option<usize>) {
+        self.think_cap = cap;
     }
 
     /// Receives the model's raw output as it is generated, every step
@@ -691,37 +822,106 @@ impl<G: Generator> Agent<G> {
             messages.extend(notes.iter().map(Message::user));
             render_prompt(&self.template, &messages, &self.tools)
         };
-        let prompt = rendered.map_err(|e| StepOutcome::Error {
+        let mut prompt = rendered.map_err(|e| StepOutcome::Error {
             message: format!("rendering prompt: {e:#}"),
             step: None,
         })?;
-        let generated_text = self
-            .generator
-            .generate(
-                &prompt,
-                self.max_new_tokens,
-                &mut *self.on_text,
-                &self.abort,
-            )
+        if self.thinking == Thinking::Off {
+            prompt.push_str(EMPTY_THINK_BLOCK);
+        }
+        let mut timing = StepTiming::default();
+        let outcome_of = |e: GenerateError| {
+            Box::new(match e {
+                GenerateError::ContextOverflow { needed, available } => {
+                    StepOutcome::ContextOverflow { needed, available }
+                }
+                GenerateError::Aborted => StepOutcome::Aborted,
+                GenerateError::Other(e) => StepOutcome::Error {
+                    message: format!("generation failed: {e:#}"),
+                    step: None,
+                },
+            })
+        };
+
+        let cap = self
+            .think_cap
+            .filter(|cap| *cap < self.max_new_tokens && self.thinking != Thinking::Off);
+        let first_budget = cap.unwrap_or(self.max_new_tokens);
+        let mut generated_text = self
+            .timed_generate(&prompt, first_budget, &mut timing)
             .await
-            .map_err(|e| {
-                Box::new(match e {
-                    GenerateError::ContextOverflow { needed, available } => {
-                        StepOutcome::ContextOverflow { needed, available }
-                    }
-                    GenerateError::Aborted => StepOutcome::Aborted,
-                    GenerateError::Other(e) => StepOutcome::Error {
-                        message: format!("generation failed: {e:#}"),
-                        step: None,
-                    },
-                })
-            })?;
+            .map_err(outcome_of)?;
+
+        if let Some(cap) = cap {
+            let split = split_thinking(&generated_text);
+            let cut_in_thinking = split.unclosed
+                && self
+                    .generator
+                    .count_tokens(&generated_text)
+                    // The decoded text can tokenize a token or two shorter
+                    // than what was generated.
+                    .is_some_and(|n| n + 2 >= cap);
+            if cut_in_thinking {
+                timing.think_capped = true;
+                (self.on_text)(FORCED_THINK_CLOSE);
+                generated_text.push_str(FORCED_THINK_CLOSE);
+                let continued = format!("{prompt}{generated_text}");
+                let rest = self
+                    .timed_generate(&continued, self.max_new_tokens - cap, &mut timing)
+                    .await
+                    .map_err(outcome_of)?;
+                generated_text.push_str(&rest);
+            }
+        }
+
+        timing.prompt_tokens = self.generator.count_tokens(&prompt).unwrap_or(0);
+        let split = split_thinking(&generated_text);
+        if split.thinking.is_some() {
+            let close_end = generated_text.len() - split.answer.len();
+            timing.think_tokens = self
+                .generator
+                .count_tokens(&generated_text[..close_end])
+                .unwrap_or(0);
+            timing.answer_tokens = self.generator.count_tokens(split.answer).unwrap_or(0);
+        } else {
+            timing.answer_tokens = self.generator.count_tokens(&generated_text).unwrap_or(0);
+        }
         let parsed = parse_output(&generated_text);
         Ok(AttemptOutput {
             prompt,
             generated_text,
             parsed,
+            timing,
         })
+    }
+
+    /// One `generate` call that streams to `on_text`, adding its time to
+    /// `timing`.
+    async fn timed_generate(
+        &mut self,
+        prompt: &str,
+        max_new_tokens: usize,
+        timing: &mut StepTiming,
+    ) -> std::result::Result<String, GenerateError> {
+        let start = now_ms();
+        let mut first_piece = None;
+        let on_text = &mut self.on_text;
+        let reply = self
+            .generator
+            .generate(
+                prompt,
+                max_new_tokens,
+                &mut |piece: &str| {
+                    first_piece.get_or_insert_with(now_ms);
+                    on_text(piece);
+                },
+                &self.abort,
+            )
+            .await;
+        let end = now_ms();
+        timing.total_ms += end - start;
+        timing.first_token_ms += first_piece.unwrap_or(end) - start;
+        reply
     }
 
     /// `parsed` if it can be accepted; otherwise why not, with a short
@@ -796,6 +996,7 @@ impl<G: Generator> Agent<G> {
 
         let mut notes: Vec<String> = Vec::new();
         let mut repeat_guard = false;
+        let mut timing = StepTiming::default();
         loop {
             let attempt = match self.generate_attempt(&notes).await {
                 Ok(a) => a,
@@ -806,7 +1007,9 @@ impl<G: Generator> Agent<G> {
                 prompt,
                 generated_text,
                 parsed,
+                timing: attempt_timing,
             } = attempt;
+            timing.add(&attempt_timing);
             match self.check(parsed) {
                 Ok(parsed) => {
                     let step = Step {
@@ -818,6 +1021,7 @@ impl<G: Generator> Agent<G> {
                         oversized_results: self.step_oversized_results,
                         repeat_guard,
                         forced_text_answer: false,
+                        timing,
                     };
                     return self.accept(step);
                 }
@@ -830,7 +1034,7 @@ impl<G: Generator> Agent<G> {
                         continue;
                     }
                     if matches!(rejection, Rejection::Repeat | Rejection::Empty) {
-                        return self.force_final_answer(notes, repeat_guard).await;
+                        return self.force_final_answer(notes, repeat_guard, timing).await;
                     }
                     return StepOutcome::Error {
                         message: format!(
@@ -874,6 +1078,7 @@ impl<G: Generator> Agent<G> {
         &mut self,
         mut notes: Vec<String>,
         repeat_guard: bool,
+        mut timing: StepTiming,
     ) -> StepOutcome {
         let retries = notes.len();
         notes.push(FINAL_ANSWER_NOTE.to_string());
@@ -885,7 +1090,9 @@ impl<G: Generator> Agent<G> {
             prompt,
             generated_text,
             parsed,
+            timing: attempt_timing,
         } = attempt;
+        timing.add(&attempt_timing);
         let parsed = match parsed {
             Ok(parsed) => parsed,
             Err(e) => {
@@ -905,6 +1112,7 @@ impl<G: Generator> Agent<G> {
             oversized_results: self.step_oversized_results,
             repeat_guard,
             forced_text_answer: true,
+            timing,
         };
         if is_text {
             self.accept(step)
@@ -1505,5 +1713,183 @@ mod tests {
         };
         assert_eq!(calls[0].name, "ping");
         assert_eq!(calls[0].arguments, serde_json::json!({}));
+    }
+
+    const QWEN3_TEMPLATE: &str = include_str!("../tests/fixtures/qwen3_chat_template.jinja");
+
+    fn qwen3_agent(generator: FakeGenerator) -> Agent<FakeGenerator> {
+        Agent::new(
+            ChatTemplate::new(QWEN3_TEMPLATE),
+            generator,
+            "You are a helpful assistant.",
+            64,
+        )
+    }
+
+    #[test]
+    fn splits_a_thinking_block_from_the_answer() {
+        let split = split_thinking("<think>\nI should call it.\n</think>\n\nHello");
+        assert_eq!(split.thinking, Some("I should call it."));
+        assert_eq!(split.answer, "\n\nHello");
+        assert!(!split.unclosed);
+
+        let split = split_thinking("no thinking here");
+        assert_eq!(split.thinking, None);
+        assert_eq!(split.answer, "no thinking here");
+
+        let split = split_thinking("<think>\n\n</think>\n\nHi");
+        assert_eq!(split.thinking, Some(""));
+        assert_eq!(split.answer, "\n\nHi");
+
+        // A template that opens the block in the prompt leaves only the close.
+        let split = split_thinking("reasoning\n</think>\n\nHi");
+        assert_eq!(split.thinking, Some("reasoning"));
+        assert_eq!(split.answer, "\n\nHi");
+
+        let split = split_thinking("<think>\nstill going");
+        assert_eq!(split.thinking, Some("still going"));
+        assert_eq!(split.answer, "");
+        assert!(split.unclosed);
+    }
+
+    #[test]
+    fn parse_output_drops_the_thinking_block() {
+        let raw = format!("<think>\nThe user wants Paris.\n</think>\n\n{PARIS_CALL}<|im_end|>");
+        assert_eq!(
+            parse_output(&raw).unwrap(),
+            ParsedOutput::ToolCalls(vec![ToolCall {
+                name: "get_weather".into(),
+                arguments: serde_json::json!({"city": "Paris"})
+            }])
+        );
+        assert_eq!(
+            parse_output("<think>\nhmm\n</think>\n\nIt is sunny.").unwrap(),
+            ParsedOutput::Text("It is sunny.".into())
+        );
+    }
+
+    #[test]
+    fn a_tool_call_written_in_the_reasoning_is_not_a_call() {
+        let raw = format!("<think>\nMaybe {PARIS_CALL} ?\n</think>\n\nIt is sunny.");
+        assert_eq!(
+            parse_output(&raw).unwrap(),
+            ParsedOutput::Text("It is sunny.".into())
+        );
+    }
+
+    #[test]
+    fn a_reply_ending_inside_the_thinking_block_is_an_error() {
+        let err = parse_output(&format!("<think>\nI could call {PARIS_CALL}")).unwrap_err();
+        assert!(err.contains("thinking block"), "{err}");
+    }
+
+    #[test]
+    fn thinking_off_ends_the_prompt_with_the_empty_block() {
+        let generator = FakeGenerator::script(&["It is sunny."]);
+        let prompts = generator.prompts();
+        let mut agent = qwen3_agent(generator);
+        agent.set_thinking(Thinking::Off);
+        let outcome = start(&mut agent);
+        assert!(matches!(outcome, StepOutcome::Final { .. }), "{outcome:?}");
+        assert!(prompts.borrow()[0].ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+
+        let generator = FakeGenerator::script(&["<think>\nok\n</think>\n\nIt is sunny."]);
+        let prompts = generator.prompts();
+        let mut agent = qwen3_agent(generator);
+        let outcome = start(&mut agent);
+        assert!(matches!(outcome, StepOutcome::Final { .. }), "{outcome:?}");
+        assert!(prompts.borrow()[0].ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn the_history_keeps_the_answer_and_not_the_reasoning() {
+        let generator = FakeGenerator::script(&[
+            &format!("<think>\nParis it is.\n</think>\n\n{PARIS_CALL}"),
+            "<think>\nSunny.\n</think>\n\nIt is sunny.",
+        ]);
+        let prompts = generator.prompts();
+        let mut agent = qwen3_agent(generator);
+        assert!(matches!(
+            start(&mut agent),
+            StepOutcome::NeedTools { .. }
+        ));
+        assert!(matches!(
+            provide(&mut agent, sunny()),
+            StepOutcome::Final { .. }
+        ));
+        assert!(!prompts.borrow()[1].contains("Paris it is."));
+    }
+
+    #[test]
+    fn step_counts_thinking_and_answer_tokens() {
+        let mut agent = qwen3_agent(FakeGenerator::script(&[
+            "<think>\na b c\n</think>\n\nit is sunny",
+        ]));
+        let StepOutcome::Final { step, .. } = start(&mut agent) else {
+            panic!("not final");
+        };
+        // The fake counts one token per whitespace-separated word.
+        assert_eq!(step.timing.think_tokens, 5);
+        assert_eq!(step.timing.answer_tokens, 3);
+        assert!(step.timing.prompt_tokens > 10);
+        assert!(!step.timing.think_capped);
+        assert!(step.timing.total_ms >= step.timing.first_token_ms);
+    }
+
+    #[test]
+    fn the_cap_closes_a_long_block_and_continues() {
+        let generator = FakeGenerator::new(|prompt| {
+            Ok(if prompt.ends_with("\n</think>\n\n") {
+                PARIS_CALL.to_string()
+            } else {
+                "<think>\none two three four five six seven eight nine".to_string()
+            })
+        });
+        let prompts = generator.prompts();
+        let budgets = generator.budgets();
+        let mut agent = qwen3_agent(generator);
+        agent.set_think_cap(Some(8));
+        let StepOutcome::NeedTools { calls, step } = start(&mut agent) else {
+            panic!("no tool call");
+        };
+        assert_eq!(calls[0].name, "get_weather");
+        assert!(step.timing.think_capped);
+        assert_eq!(*budgets.borrow(), vec![8, 56]);
+        let prompts = prompts.borrow();
+        assert_eq!(
+            prompts[1],
+            format!(
+                "{}<think>\none two three four five six seven eight nine\n</think>\n\n",
+                prompts[0]
+            )
+        );
+        assert!(step.generated_text.ends_with(PARIS_CALL));
+        assert_eq!(step.timing.think_tokens, 11);
+    }
+
+    #[test]
+    fn the_cap_leaves_a_block_that_closed_by_itself() {
+        let generator = FakeGenerator::script(&["<think>\none two three four five six\n</think>\n\nIt is sunny."]);
+        let budgets = generator.budgets();
+        let mut agent = qwen3_agent(generator);
+        agent.set_think_cap(Some(8));
+        let StepOutcome::Final { step, .. } = start(&mut agent) else {
+            panic!("not final");
+        };
+        assert!(!step.timing.think_capped);
+        assert_eq!(budgets.borrow().len(), 1);
+    }
+
+    #[test]
+    fn the_cap_does_not_cut_a_reply_that_never_thinks() {
+        let generator = FakeGenerator::script(&["one two three four five six seven eight nine ten"]);
+        let budgets = generator.budgets();
+        let mut agent = qwen3_agent(generator);
+        agent.set_think_cap(Some(8));
+        let StepOutcome::Final { step, .. } = start(&mut agent) else {
+            panic!("not final");
+        };
+        assert!(!step.timing.think_capped);
+        assert_eq!(budgets.borrow().len(), 1);
     }
 }

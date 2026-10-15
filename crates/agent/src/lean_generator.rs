@@ -76,4 +76,8 @@ impl Generator for LeanGenerator {
             Err(LeanError::Other(e)) => Err(GenerateError::Other(e)),
         }
     }
+
+    fn count_tokens(&self, text: &str) -> Option<usize> {
+        self.lean.token_count(text).ok()
+    }
 }
