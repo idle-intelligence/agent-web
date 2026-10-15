@@ -27,8 +27,8 @@ console_error_panic_hook = "0.1"
 # llm-web so a clean clone always resolves the same API. No default
 # features: the agent crate turns on `threads` natively and agent-wasm
 # turns on `web`.
-lean = { git = "https://github.com/idle-intelligence/llm-web", rev = "1fce23d866c23fb6f3635abb51db52c50ff87808", default-features = false }
-lean-chat = { git = "https://github.com/idle-intelligence/llm-web", rev = "1fce23d866c23fb6f3635abb51db52c50ff87808" }
+lean = { git = "https://github.com/idle-intelligence/llm-web", rev = "6daf322d8759f570b7bd01363bbe0c7ab6cc21b3", default-features = false }
+lean-chat = { git = "https://github.com/idle-intelligence/llm-web", rev = "6daf322d8759f570b7bd01363bbe0c7ab6cc21b3" }
 
 [profile.release]
 lto = true
