@@ -260,6 +260,8 @@ pub struct CaseResult {
     pub reason: String,
     pub steps: usize,
     pub calls_made: Vec<ToolCall>,
+    /// The run's final text answer, when it ended in one.
+    pub final_text: Option<String>,
     pub total_ms: f64,
     pub retries: usize,
     pub tool_errors: usize,
@@ -517,6 +519,7 @@ pub async fn run_case<G: Generator, C: ToolCaller + CallLog>(
     let mut retries = 0usize;
     let mut tool_errors = 0usize;
     let mut households: Option<Value> = None;
+    let mut final_text: Option<String> = None;
 
     let mut step_timings: Vec<StepTiming> = Vec::new();
     let mut accumulate = |step: &crate::agent::Step| {
@@ -532,7 +535,10 @@ pub async fn run_case<G: Generator, C: ToolCaller + CallLog>(
             StepOutcome::Final { text, step } => {
                 accumulate(&step);
                 let calls_made = to_tool_calls(caller.calls_seen());
-                break score_with_answer(case, &calls_made, households.as_ref(), true, Some(&text));
+                let scored =
+                    score_with_answer(case, &calls_made, households.as_ref(), true, Some(&text));
+                final_text = Some(text);
+                break scored;
             }
             StepOutcome::NeedTools { calls, step } => {
                 accumulate(&step);
@@ -574,6 +580,7 @@ pub async fn run_case<G: Generator, C: ToolCaller + CallLog>(
         reason,
         steps,
         calls_made: to_tool_calls(caller.calls_seen()),
+        final_text,
         total_ms,
         retries,
         tool_errors,
@@ -599,6 +606,7 @@ fn skipped_result(case: &EvalCase) -> CaseResult {
         reason: "subset_ok=false: not solvable under the 13-tool subset".to_string(),
         steps: 0,
         calls_made: Vec::new(),
+        final_text: None,
         total_ms: 0.0,
         retries: 0,
         tool_errors: 0,
@@ -759,6 +767,30 @@ pub fn render_markdown(report: &EvalReport) -> String {
             all.decode_ms() / 1000.0 / n,
             all.total_ms / 1000.0 / n
         );
+    }
+
+    let failed: Vec<&&CaseResult> = scored.iter().filter(|r| !r.correct).collect();
+    if !failed.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "**Failed cases, calls made and final answer**:");
+        let _ = writeln!(out);
+        for r in failed {
+            let calls: Vec<String> = r
+                .calls_made
+                .iter()
+                .map(|c| format!("`{}({})`", c.name, c.arguments))
+                .collect();
+            let calls = if calls.is_empty() {
+                "no call".to_string()
+            } else {
+                calls.join(", ")
+            };
+            let answer = match &r.final_text {
+                Some(t) => format!("{:?}", t.trim()),
+                None => "no final answer".to_string(),
+            };
+            let _ = writeln!(out, "- {}: {calls}; answer: {answer}", r.id);
+        }
     }
 
     out
