@@ -792,7 +792,7 @@
     "expected": [],
     "accept": "no_mutation",
     "subset_ok": true,
-    "notes": "No 'Garage' room/group/player exists in the canned household. Expect no mutating tool call (the model should say it can't find that room, not guess an id), scored with accept 'no_mutation'."
+    "notes": "No 'Garage' room/group/player exists in the canned household. Expect no successful mutating tool call (the model should say it can't find that room, not guess an id), scored with accept 'no_mutation'. A mutating call the server rejects (unknown id, error result) changed nothing and does not count as a mutation."
   },
   {
     "id": "m22",
@@ -919,7 +919,7 @@
     "expected": [],
     "accept": "no_mutation",
     "subset_ok": true,
-    "notes": "Same pattern as m11 but with a speaker name ('BLOUPBLIP') that has no match in the fixture household. As for m21, expect no mutating tool call: the model should say it can't find that speaker, not guess an id. A read such as the household lookup first is allowed."
+    "notes": "Same pattern as m11 but with a speaker name ('BLOUPBLIP') that has no match in the fixture household. As for m21, expect no successful mutating tool call: the model should say it can't find that speaker, not guess an id. A read such as the household lookup first is allowed."
   },
   {
     "id": "m28",

@@ -8,8 +8,8 @@
 //! build.
 
 use crate::agent::{
-    call_or_error, tools_from_mcp, Agent, Generator, StepOutcome, StepTiming, Tool, ToolCall,
-    ToolCaller,
+    call_or_error, tool_error_message, tools_from_mcp, Agent, Generator, StepOutcome, StepTiming,
+    Tool, ToolCall, ToolCaller,
 };
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -424,11 +424,7 @@ pub fn score(
     score_with_answer(case, calls_made, households, ended_in_final, None)
 }
 
-/// Score `calls_made` (in order) against `case.expected`, then
-/// `final_text` against the case's `answer_contains_*`; if that fails, the
-/// case's `alternatives` the same way, in order. `is_mutating` falls back
-/// to the `get_`-prefix heuristic since this fixture tool set carries no
-/// MCP `annotations`.
+/// [`score_run`] with every call's result a success.
 pub fn score_with_answer(
     case: &EvalCase,
     calls_made: &[ToolCall],
@@ -436,7 +432,39 @@ pub fn score_with_answer(
     ended_in_final: bool,
     final_text: Option<&str>,
 ) -> (bool, String) {
-    let main = score_one(case, calls_made, households, ended_in_final, final_text);
+    score_run(
+        case,
+        calls_made,
+        &[],
+        households,
+        ended_in_final,
+        final_text,
+    )
+}
+
+/// Score `calls_made` (in order) against `case.expected`, then
+/// `final_text` against the case's `answer_contains_*`; if that fails, the
+/// case's `alternatives` the same way, in order. `rejected[i]` is true when
+/// call `i` got an error result (missing entries count as successes); a
+/// rejected mutating call changed nothing, so it does not count as a
+/// mutation. `is_mutating` falls back to the `get_`-prefix heuristic since
+/// this fixture tool set carries no MCP `annotations`.
+pub fn score_run(
+    case: &EvalCase,
+    calls_made: &[ToolCall],
+    rejected: &[bool],
+    households: Option<&Value>,
+    ended_in_final: bool,
+    final_text: Option<&str>,
+) -> (bool, String) {
+    let main = score_one(
+        case,
+        calls_made,
+        rejected,
+        households,
+        ended_in_final,
+        final_text,
+    );
     if main.0 {
         return main;
     }
@@ -452,6 +480,7 @@ pub fn score_with_answer(
         let (ok, reason) = score_one(
             &alt_case,
             calls_made,
+            rejected,
             households,
             ended_in_final,
             final_text,
@@ -466,11 +495,12 @@ pub fn score_with_answer(
 fn score_one(
     case: &EvalCase,
     calls_made: &[ToolCall],
+    rejected: &[bool],
     households: Option<&Value>,
     ended_in_final: bool,
     final_text: Option<&str>,
 ) -> (bool, String) {
-    let (ok, reason) = score_calls(case, calls_made, households, ended_in_final);
+    let (ok, reason) = score_calls(case, calls_made, rejected, households, ended_in_final);
     if !ok {
         return (ok, reason);
     }
@@ -483,6 +513,7 @@ fn score_one(
 fn score_calls(
     case: &EvalCase,
     calls_made: &[ToolCall],
+    rejected: &[bool],
     households: Option<&Value>,
     ended_in_final: bool,
 ) -> (bool, String) {
@@ -578,7 +609,21 @@ fn score_calls(
                     "no_mutation mode: run did not end in a final text answer".to_string(),
                 );
             }
-            match calls_made.iter().find(|c| is_mutating(&c.name)) {
+            let is_rejected = |i: usize| rejected.get(i).copied().unwrap_or(false);
+            let mutations = calls_made
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| is_mutating(&c.name));
+            match mutations
+                .clone()
+                .find(|(i, _)| !is_rejected(*i))
+                .map(|(_, c)| c)
+            {
+                None if mutations.count() > 0 => (
+                    true,
+                    "no mutating call succeeded (all rejected); final text answer given"
+                        .to_string(),
+                ),
                 None => (
                     true,
                     "no mutating call made; final text answer given".to_string(),
@@ -655,6 +700,7 @@ pub async fn run_case<G: Generator, C: ToolCaller + CallLog>(
     let mut tool_errors = 0usize;
     let mut households: Option<Value> = None;
     let mut final_text: Option<String> = None;
+    let mut rejected: Vec<bool> = Vec::new();
 
     let mut step_timings: Vec<StepTiming> = Vec::new();
     let mut accumulate = |step: &crate::agent::Step| {
@@ -670,8 +716,14 @@ pub async fn run_case<G: Generator, C: ToolCaller + CallLog>(
             StepOutcome::Final { text, step } => {
                 accumulate(&step);
                 let calls_made = to_tool_calls(caller.calls_seen());
-                let scored =
-                    score_with_answer(case, &calls_made, households.as_ref(), true, Some(&text));
+                let scored = score_run(
+                    case,
+                    &calls_made,
+                    &rejected,
+                    households.as_ref(),
+                    true,
+                    Some(&text),
+                );
                 final_text = Some(text);
                 break scored;
             }
@@ -680,6 +732,7 @@ pub async fn run_case<G: Generator, C: ToolCaller + CallLog>(
                 let mut results = Vec::with_capacity(calls.len());
                 for call in &calls {
                     let result = call_or_error(caller, call);
+                    rejected.push(tool_error_message(&result).is_some());
                     if call.name == "get_households_and_groups_and_players" {
                         households = Some(result.clone());
                     }
@@ -687,7 +740,14 @@ pub async fn run_case<G: Generator, C: ToolCaller + CallLog>(
                 }
                 if caller.calls_seen().len() > MAX_TOOL_CALLS {
                     let calls_made = to_tool_calls(caller.calls_seen());
-                    break score(case, &calls_made, households.as_ref(), false);
+                    break score_run(
+                        case,
+                        &calls_made,
+                        &rejected,
+                        households.as_ref(),
+                        false,
+                        None,
+                    );
                 }
                 outcome = agent.provide_tool_results(results).await;
             }
@@ -1262,6 +1322,58 @@ mod tests {
         };
         assert!(!score(&c, &[play("BLOUPBLIP")], None, true).0);
         assert!(!score(&c, &[listing, play("RINCON_KITCHEN01:1")], None, true).0);
+    }
+
+    #[test]
+    fn no_mutation_ignores_rejected_mutating_calls() {
+        let m27 = case("m27");
+        let listing = call("get_households_and_groups_and_players", json!({}));
+        let bad = call(
+            "play_artist",
+            json!({"group_id": "BLOUPBLIP", "artist": "Nirvana", "shuffle": false}),
+        );
+        let made = [listing.clone(), bad.clone()];
+        let answer = Some("I could not find a speaker called BLOUPBLIP.");
+        assert!(score_run(&m27, &made, &[false, true], None, true, answer).0);
+        assert!(!score_run(&m27, &made, &[false, false], None, true, answer).0);
+        assert!(!score_run(&m27, &made, &[false, true], None, false, None).0);
+        let good = call(
+            "play_artist",
+            json!({"group_id": "RINCON_KITCHEN01:1", "artist": "Nirvana", "shuffle": false}),
+        );
+        let made = [listing, bad, good];
+        assert!(!score_run(&m27, &made, &[false, true, false], None, true, answer).0);
+    }
+
+    #[test]
+    fn run_case_passes_a_rejected_call_followed_by_a_correct_answer() {
+        let run = |script: &[&str]| {
+            let mut agent = Agent::new(
+                ChatTemplate::new(QWEN25_TOOLS_TEMPLATE),
+                FakeGenerator::script(script),
+                "You are a helpful home assistant.",
+                64,
+            );
+            let all = load_all_tools(fixtures_dir()).unwrap();
+            let tools = select_tools(&all, ToolSet::Subset, fixtures_dir()).unwrap();
+            let mut caller = FixtureCaller::new(format!("{}/results", fixtures_dir()));
+            pollster::block_on(run_case(&mut agent, &tools, &case("m21"), &mut caller))
+        };
+        let rejected = run(&[
+            "<tool_call>\n{\"name\": \"pause\", \"arguments\": {\"group_id\": \"garage\"}}\n</tool_call>",
+            "There is no garage speaker in your home.",
+        ]);
+        assert!(rejected.correct, "{}", rejected.reason);
+        assert_eq!(rejected.tool_errors, 1);
+        let paused = run(&[
+            "<tool_call>\n{\"name\": \"pause\", \"arguments\": {\"group_id\": \"RINCON_KITCHEN01:1\"}}\n</tool_call>",
+            "Paused.",
+        ]);
+        assert!(
+            paused.reason.contains("mutating call pause"),
+            "{}",
+            paused.reason
+        );
     }
 
     fn two_step_cases() -> Vec<EvalCase> {
