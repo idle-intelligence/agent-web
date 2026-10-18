@@ -8,8 +8,12 @@
 //! one JSON "outcome" object the page inspects to decide whether to call
 //! tools or show the final answer:
 //!
-//! - `{"type": "needTools", "calls": [{"callId", "name", "arguments"}]}`
-//! - `{"type": "final", "text": "..."}`
+//! - `{"type": "needTools", "calls": [{"callId", "name", "arguments"}], "timing": T}`
+//! - `{"type": "final", "text": "...", "timing": T}`
+//!
+//! where `T` is `{"promptTokens", "thinkTokens", "answerTokens"}`, the
+//! token counts of the step (0 when the generator cannot count).
+//!
 //! - `{"type": "contextOverflow", "needed": n, "available": n}`
 //! - `{"type": "aborted"}`
 //! - `{"type": "error", "message": "..."}`
@@ -24,20 +28,33 @@ use std::cell::RefCell;
 
 use wasm_bindgen::prelude::*;
 
-use agent::agent::{AbortFlag, Agent, PendingToolCall, StepOutcome, Thinking};
+use agent::agent::{AbortFlag, Agent, PendingToolCall, Step, StepOutcome, Thinking};
 use agent::lean_generator::LeanGenerator;
 use anyhow::Result;
 use lean::{Backend, GgufSource, LoadOptions, TokenizerSource};
 use serde_json::Value;
 
+/// Token counts of a step, as the `timing` field of `needTools` and
+/// `final` outcomes. Times are not reported: wasm32 has no monotonic clock
+/// in the agent, so the page times the step itself.
+fn timing_json(step: &Step) -> Value {
+    serde_json::json!({
+        "promptTokens": step.timing.prompt_tokens,
+        "thinkTokens": step.timing.think_tokens,
+        "answerTokens": step.timing.answer_tokens,
+    })
+}
+
 fn outcome_to_json(outcome: StepOutcome) -> String {
     match outcome {
-        StepOutcome::NeedTools { calls, .. } => {
+        StepOutcome::NeedTools { calls, step } => {
             let calls: Vec<Value> = calls.iter().map(|c: &PendingToolCall| serde_json::json!({"callId": c.call_id, "name": c.name, "arguments": c.arguments})).collect();
-            serde_json::json!({"type": "needTools", "calls": calls}).to_string()
+            serde_json::json!({"type": "needTools", "calls": calls, "timing": timing_json(&step)})
+                .to_string()
         }
-        StepOutcome::Final { text, .. } => {
-            serde_json::json!({"type": "final", "text": text}).to_string()
+        StepOutcome::Final { text, step } => {
+            serde_json::json!({"type": "final", "text": text, "timing": timing_json(&step)})
+                .to_string()
         }
         StepOutcome::ContextOverflow { needed, available } => {
             serde_json::json!({"type": "contextOverflow", "needed": needed, "available": available})
@@ -203,5 +220,53 @@ impl AgentJs {
 
     fn put(&self, agent: Agent<LeanGenerator>) {
         *self.agent.borrow_mut() = Some(agent);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent::agent::{ParsedOutput, StepTiming};
+
+    fn step(timing: StepTiming) -> Step {
+        Step {
+            prompt: String::new(),
+            generated_text: String::new(),
+            parsed: ParsedOutput::Text(String::new()),
+            retries: 0,
+            tool_errors: 0,
+            oversized_results: 0,
+            repeat_guard: false,
+            forced_text_answer: false,
+            timing,
+        }
+    }
+
+    #[test]
+    fn need_tools_and_final_carry_token_counts() {
+        let timing = StepTiming {
+            prompt_tokens: 812,
+            think_tokens: 40,
+            answer_tokens: 17,
+            ..Default::default()
+        };
+        let expected =
+            serde_json::json!({"promptTokens": 812, "thinkTokens": 40, "answerTokens": 17});
+
+        let v: Value = serde_json::from_str(&outcome_to_json(StepOutcome::NeedTools {
+            calls: vec![],
+            step: step(timing),
+        }))
+        .unwrap();
+        assert_eq!(v["type"], "needTools");
+        assert_eq!(v["timing"], expected);
+
+        let v: Value = serde_json::from_str(&outcome_to_json(StepOutcome::Final {
+            text: "ok".into(),
+            step: step(timing),
+        }))
+        .unwrap();
+        assert_eq!(v["type"], "final");
+        assert_eq!(v["timing"], expected);
     }
 }
