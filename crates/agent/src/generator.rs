@@ -91,4 +91,27 @@ pub trait Generator {
         on_text: &mut dyn FnMut(&str),
         abort: &AbortFlag,
     ) -> impl Future<Output = Result<String, GenerateError>>;
+
+    /// How many tokens the engine's tokenizer makes of `text`, or `None`
+    /// when it cannot say. The agent uses it for token accounting and for
+    /// the thinking cap, which does nothing without it.
+    fn count_tokens(&self, _text: &str) -> Option<usize> {
+        None
+    }
+}
+
+/// Milliseconds on a monotonic clock, for per-step timing. Always 0 on
+/// wasm32, where `std::time::Instant` is not available.
+pub fn now_ms() -> f64 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::OnceLock;
+        use std::time::Instant;
+        static START: OnceLock<Instant> = OnceLock::new();
+        START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        0.0
+    }
 }

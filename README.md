@@ -60,12 +60,13 @@ cargo run -p agent --example agent_cli --release -- \
   --utterance "pause the kitchen"
 ```
 
-The eval set, as a markdown table on stdout (`AGENT_EVAL_MAX_CTX` sets the context size in tokens, default 4096; `AGENT_EVAL_DATE` the date in the table's title):
+The eval set, as a markdown table on stdout. `--fixture-set` picks the Sonos set (default) or the small two-step tool-chaining set (`crates/agent/fixtures/two-step`); `--thinking template|off` and `--think-cap N` control Qwen3's thinking block; `--only s01,m02` runs some cases:
 
 ```sh
-LEAN_GGUF_QWEN25_3B=models/Qwen2.5-3B-Instruct-GGUF/qwen2.5-3b-instruct-q4_0.gguf \
-LEAN_TOKENIZER_DIR_QWEN25_3B=models/Qwen2.5-3B-Instruct \
-cargo run -p agent --example agent_eval --release
+cargo run -p agent --example agent_eval --release -- \
+  --model models/Qwen3-1.7B-GGUF/Qwen3-1.7B-Q8_0.gguf \
+  --tokenizer-dir models/Qwen3-1.7B \
+  --model-label Qwen3-1.7B-Q8_0 --max-new-tokens 1024
 ```
 
 Both pick the backend by capability: the GPU when a wgpu adapter is available, otherwise the CPU forward pass on every core. Each step reuses the KV cache of the previous one for the prompt prefix they share, so the system prompt and the tools are prefilled once per turn.

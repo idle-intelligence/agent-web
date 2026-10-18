@@ -8,7 +8,8 @@
 //! build.
 
 use crate::agent::{
-    call_or_error, tools_from_mcp, Agent, Generator, StepOutcome, Tool, ToolCall, ToolCaller,
+    call_or_error, tool_error_message, tools_from_mcp, Agent, Generator, StepOutcome, StepTiming,
+    Tool, ToolCall, ToolCaller,
 };
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -24,12 +25,35 @@ pub enum Accept {
     NoMutation,
     #[serde(rename = "any_play")]
     AnyPlay,
+    /// Exactly `case.expected.len()` calls in order; each call's name must
+    /// match and its arguments must match on the expected keys only (extra
+    /// keys are ignored), with string values compared case-insensitively.
+    #[serde(rename = "exact_args")]
+    ExactArgs,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ExpectedCall {
     pub name: String,
     pub args: Value,
+    /// Numeric arguments accepted anywhere in an inclusive `[min, max]`
+    /// range instead of at one value (an unquantified "a bit" volume
+    /// nudge). A key listed here is left out of `args`.
+    #[serde(default)]
+    pub arg_ranges: std::collections::BTreeMap<String, [f64; 2]>,
+}
+
+/// Another way for a case to pass: its own calls, acceptance mode and
+/// answer checks, scored as the case's are.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Alternative {
+    #[serde(default)]
+    pub expected: Vec<ExpectedCall>,
+    pub accept: Accept,
+    #[serde(default)]
+    pub answer_contains_any: Vec<String>,
+    #[serde(default)]
+    pub answer_contains_all: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -44,6 +68,18 @@ pub struct EvalCase {
     pub notes: String,
     #[serde(default)]
     pub lang: Option<String>,
+    /// If non-empty, the final text answer must contain at least one of
+    /// these substrings (case-insensitive), on top of what `accept`
+    /// requires of the calls.
+    #[serde(default)]
+    pub answer_contains_any: Vec<String>,
+    /// If non-empty, the final text answer must contain every one of these
+    /// substrings (case-insensitive).
+    #[serde(default)]
+    pub answer_contains_all: Vec<String>,
+    /// The case also passes if any of these passes.
+    #[serde(default)]
+    pub alternatives: Vec<Alternative>,
 }
 
 /// A [`ToolCaller`] that serves canned JSON results from
@@ -51,6 +87,72 @@ pub struct EvalCase {
 pub struct FixtureCaller {
     results_dir: std::path::PathBuf,
     pub calls_seen: Vec<(String, Value)>,
+}
+
+/// A [`ToolCaller`] whose calls so far the eval can read back.
+pub trait CallLog {
+    fn calls_seen(&self) -> &[(String, Value)];
+}
+
+impl CallLog for FixtureCaller {
+    fn calls_seen(&self) -> &[(String, Value)] {
+        &self.calls_seen
+    }
+}
+
+/// A [`ToolCaller`] for the two-step fixture set (`fixtures/two-step/`):
+/// `get_location` and `list_rooms` return a fixed value; `get_weather` and
+/// `set_volume` compute their result from their arguments, which no static
+/// per-tool file can do.
+#[derive(Default)]
+pub struct TwoStepCaller {
+    pub calls_seen: Vec<(String, Value)>,
+}
+
+impl TwoStepCaller {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl ToolCaller for TwoStepCaller {
+    fn call(&mut self, name: &str, args: &Value) -> Result<Value> {
+        self.calls_seen.push((name.to_string(), args.clone()));
+        let result = match name {
+            "get_location" => serde_json::json!({ "city": "Lyon", "country": "FR" }),
+            "get_weather" => {
+                let city = args.get("city").and_then(Value::as_str).unwrap_or("");
+                let fahrenheit = args.get("unit").and_then(Value::as_str) == Some("fahrenheit");
+                serde_json::json!({
+                    "city": city,
+                    "temp": if fahrenheit { 63 } else { 17 },
+                    "condition": "light rain",
+                })
+            }
+            "list_rooms" => serde_json::json!([
+                { "id": "RINCON_K1", "name": "Kitchen" },
+                { "id": "RINCON_L2", "name": "Living room" },
+            ]),
+            "set_volume" => {
+                let room_id = args.get("room_id").and_then(Value::as_str).unwrap_or("");
+                let level = args.get("level").cloned().unwrap_or(Value::Null);
+                match room_id {
+                    "RINCON_K1" | "RINCON_L2" => {
+                        serde_json::json!({ "ok": true, "room_id": room_id, "level": level })
+                    }
+                    _ => serde_json::json!({ "error": "unknown room_id" }),
+                }
+            }
+            other => anyhow::bail!("TwoStepCaller: unknown tool {other}"),
+        };
+        Ok(result)
+    }
+}
+
+impl CallLog for TwoStepCaller {
+    fn calls_seen(&self) -> &[(String, Value)] {
+        &self.calls_seen
+    }
 }
 
 impl FixtureCaller {
@@ -62,13 +164,81 @@ impl FixtureCaller {
     }
 }
 
-impl ToolCaller for FixtureCaller {
-    fn call(&mut self, name: &str, args: &Value) -> Result<Value> {
-        self.calls_seen.push((name.to_string(), args.clone()));
+const HOUSEHOLDS_TOOL: &str = "get_households_and_groups_and_players";
+
+impl FixtureCaller {
+    fn read_result(&self, name: &str) -> Result<Value> {
         let path = self.results_dir.join(format!("{name}.json"));
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading fixture result {path:?}"))?;
         Ok(serde_json::from_str(&text)?)
+    }
+
+    /// The first group or player id in `args` that the fixture household
+    /// does not have, as the error a server would return for it.
+    fn unknown_id_error(&self, args: &Value) -> Result<Option<Value>> {
+        let households = self.read_result(HOUSEHOLDS_TOOL)?;
+        let household = &households["households"][0];
+        let ids = |list: &str, key: &str| -> Vec<String> {
+            household[list]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v[key].as_str().map(str::to_string))
+                .collect()
+        };
+        let groups = ids("groups", "groupId");
+        let players = ids("players", "playerId");
+        let household_id = household["householdId"].as_str().unwrap_or("");
+        let checks: [(&str, &[String], &str); 5] = [
+            ("group_id", &groups, "group"),
+            ("source_group_id", &groups, "group"),
+            ("player_id", &players, "player"),
+            ("player_ids", &players, "player"),
+            ("destination_player_ids", &players, "player"),
+        ];
+        for (key, known, what) in checks {
+            let given: Vec<&Value> = match args.get(key) {
+                Some(Value::Array(items)) => items.iter().collect(),
+                Some(v) => vec![v],
+                None => continue,
+            };
+            for v in given {
+                let id = v
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string());
+                if !known.contains(&id) {
+                    return Ok(Some(serde_json::json!({
+                        "error": format!("{what} {id:?} not found in household {household_id}")
+                    })));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Serves `<results_dir>/<tool>.json` like the Sonos MCP server would: a
+/// group or player id that the fixture household does not have gets an
+/// `error` result, and a result file of the form `{"by_group_id": {...}}`
+/// answers with the entry of the call's `group_id`.
+impl ToolCaller for FixtureCaller {
+    fn call(&mut self, name: &str, args: &Value) -> Result<Value> {
+        self.calls_seen.push((name.to_string(), args.clone()));
+        if let Some(error) = self.unknown_id_error(args)? {
+            return Ok(error);
+        }
+        let result = self.read_result(name)?;
+        match result.get("by_group_id") {
+            Some(by_group) => {
+                let group = args.get("group_id").and_then(Value::as_str).unwrap_or("");
+                by_group.get(group).cloned().with_context(|| {
+                    format!("fixture result {name}.json has no entry for group {group:?}")
+                })
+            }
+            None => Ok(result),
+        }
     }
 }
 
@@ -85,6 +255,14 @@ pub fn load_cases(path: impl AsRef<Path>) -> Result<Vec<EvalCase>> {
 pub enum ToolSet {
     All,
     Subset,
+    /// The two-step fixture set's own four tools
+    /// (`fixtures/two-step/tools.json`), no subsetting.
+    TwoStep,
+}
+
+/// The two-step fixture set's fixed tool list.
+pub fn load_two_step_tools(fixtures_dir: impl AsRef<Path>) -> Result<Vec<Tool>> {
+    load_mcp_tools(fixtures_dir.as_ref().join("tools.json"))
 }
 
 fn load_mcp_tools(path: impl AsRef<Path>) -> Result<Vec<Tool>> {
@@ -109,6 +287,11 @@ pub fn select_tools(
 ) -> Result<Vec<Tool>> {
     match subset {
         ToolSet::All => Ok(all.to_vec()),
+        ToolSet::TwoStep => {
+            anyhow::bail!(
+                "ToolSet::TwoStep has no subset of a Sonos tool set; use load_two_step_tools"
+            )
+        }
         ToolSet::Subset => {
             let subset = load_mcp_tools(fixtures_dir.as_ref().join("tools-subset.json"))?;
             subset
@@ -166,26 +349,171 @@ pub struct CaseResult {
     pub reason: String,
     pub steps: usize,
     pub calls_made: Vec<ToolCall>,
+    /// The run's final text answer, when it ended in one.
+    pub final_text: Option<String>,
     pub total_ms: f64,
     pub retries: usize,
     pub tool_errors: usize,
+    /// Token and time accounting of each step, in order.
+    pub step_timings: Vec<StepTiming>,
 }
 
 const MAX_TOOL_CALLS: usize = 6;
 
-fn args_match(expected: &Value, made: &Value) -> bool {
-    match (expected, made) {
+fn ranges_match(expected: &ExpectedCall, made: &Value) -> bool {
+    expected.arg_ranges.iter().all(|(k, [lo, hi])| {
+        made.get(k)
+            .and_then(Value::as_f64)
+            .is_some_and(|v| (*lo..=*hi).contains(&v))
+    })
+}
+
+fn args_match(expected: &ExpectedCall, made: &Value) -> bool {
+    let plain = match (&expected.args, made) {
         (Value::Object(exp), Value::Object(got)) => exp.iter().all(|(k, v)| got.get(k) == Some(v)),
-        _ => expected == made,
+        _ => &expected.args == made,
+    };
+    plain && ranges_match(expected, made)
+}
+
+fn values_match_ci(expected: &Value, got: &Value) -> bool {
+    match (expected, got) {
+        (Value::String(e), Value::String(g)) => e.to_lowercase() == g.to_lowercase(),
+        _ => expected == got,
     }
 }
 
-/// Score `calls_made` (in order) against `case.expected`. `is_mutating`
-/// falls back to the `get_`-prefix heuristic since this fixture tool set
-/// carries no MCP `annotations`.
+fn args_match_ci(expected: &ExpectedCall, made: &Value) -> bool {
+    let plain = match (&expected.args, made) {
+        (Value::Object(exp), Value::Object(got)) => exp
+            .iter()
+            .all(|(k, v)| got.get(k).is_some_and(|g| values_match_ci(v, g))),
+        _ => values_match_ci(&expected.args, made),
+    };
+    plain && ranges_match(expected, made)
+}
+
+/// Why the final text answer fails the case's `answer_contains_*`, if it
+/// does.
+fn answer_check(case: &EvalCase, final_text: Option<&str>) -> Option<String> {
+    let text = final_text.unwrap_or("").to_lowercase();
+    let has = |s: &String| text.contains(&s.to_lowercase());
+    if !case.answer_contains_any.is_empty() && !case.answer_contains_any.iter().any(has) {
+        return Some(format!(
+            "final answer did not contain any of {:?}: {:?}",
+            case.answer_contains_any, final_text
+        ));
+    }
+    if !case.answer_contains_all.iter().all(has) {
+        return Some(format!(
+            "final answer did not contain all of {:?}: {:?}",
+            case.answer_contains_all, final_text
+        ));
+    }
+    None
+}
+
+/// [`score`] without the final answer: for cases with no
+/// `answer_contains_*`.
 pub fn score(
     case: &EvalCase,
     calls_made: &[ToolCall],
+    households: Option<&Value>,
+    ended_in_final: bool,
+) -> (bool, String) {
+    score_with_answer(case, calls_made, households, ended_in_final, None)
+}
+
+/// [`score_run`] with every call's result a success.
+pub fn score_with_answer(
+    case: &EvalCase,
+    calls_made: &[ToolCall],
+    households: Option<&Value>,
+    ended_in_final: bool,
+    final_text: Option<&str>,
+) -> (bool, String) {
+    score_run(
+        case,
+        calls_made,
+        &[],
+        households,
+        ended_in_final,
+        final_text,
+    )
+}
+
+/// Score `calls_made` (in order) against `case.expected`, then
+/// `final_text` against the case's `answer_contains_*`; if that fails, the
+/// case's `alternatives` the same way, in order. `rejected[i]` is true when
+/// call `i` got an error result (missing entries count as successes); a
+/// rejected mutating call changed nothing, so it does not count as a
+/// mutation. `is_mutating` falls back to the `get_`-prefix heuristic since
+/// this fixture tool set carries no MCP `annotations`.
+pub fn score_run(
+    case: &EvalCase,
+    calls_made: &[ToolCall],
+    rejected: &[bool],
+    households: Option<&Value>,
+    ended_in_final: bool,
+    final_text: Option<&str>,
+) -> (bool, String) {
+    let main = score_one(
+        case,
+        calls_made,
+        rejected,
+        households,
+        ended_in_final,
+        final_text,
+    );
+    if main.0 {
+        return main;
+    }
+    for (i, alt) in case.alternatives.iter().enumerate() {
+        let alt_case = EvalCase {
+            expected: alt.expected.clone(),
+            accept: alt.accept,
+            answer_contains_any: alt.answer_contains_any.clone(),
+            answer_contains_all: alt.answer_contains_all.clone(),
+            alternatives: Vec::new(),
+            ..case.clone()
+        };
+        let (ok, reason) = score_one(
+            &alt_case,
+            calls_made,
+            rejected,
+            households,
+            ended_in_final,
+            final_text,
+        );
+        if ok {
+            return (true, format!("alternative {i}: {reason}"));
+        }
+    }
+    main
+}
+
+fn score_one(
+    case: &EvalCase,
+    calls_made: &[ToolCall],
+    rejected: &[bool],
+    households: Option<&Value>,
+    ended_in_final: bool,
+    final_text: Option<&str>,
+) -> (bool, String) {
+    let (ok, reason) = score_calls(case, calls_made, rejected, households, ended_in_final);
+    if !ok {
+        return (ok, reason);
+    }
+    match answer_check(case, final_text) {
+        Some(why) => (false, why),
+        None => (ok, reason),
+    }
+}
+
+fn score_calls(
+    case: &EvalCase,
+    calls_made: &[ToolCall],
+    rejected: &[bool],
     households: Option<&Value>,
     ended_in_final: bool,
 ) -> (bool, String) {
@@ -234,9 +562,10 @@ pub fn score(
             if !required.is_empty() {
                 let mut cursor = 0usize;
                 for expected in &required {
-                    match calls_made[cursor..].iter().position(|c| {
-                        c.name == expected.name && args_match(&expected.args, &c.arguments)
-                    }) {
+                    match calls_made[cursor..]
+                        .iter()
+                        .position(|c| c.name == expected.name && args_match(expected, &c.arguments))
+                    {
                         Some(offset) => cursor += offset + 1,
                         None => {
                             return (
@@ -259,7 +588,7 @@ pub fn score(
                 };
                 if calls_made
                     .iter()
-                    .any(|c| c.name == last.name && args_match(&last.args, &c.arguments))
+                    .any(|c| c.name == last.name && args_match(last, &c.arguments))
                 {
                     (true, "final read made with correct args".to_string())
                 } else {
@@ -280,7 +609,21 @@ pub fn score(
                     "no_mutation mode: run did not end in a final text answer".to_string(),
                 );
             }
-            match calls_made.iter().find(|c| is_mutating(&c.name)) {
+            let is_rejected = |i: usize| rejected.get(i).copied().unwrap_or(false);
+            let mutations = calls_made
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| is_mutating(&c.name));
+            match mutations
+                .clone()
+                .find(|(i, _)| !is_rejected(*i))
+                .map(|(_, c)| c)
+            {
+                None if mutations.count() > 0 => (
+                    true,
+                    "no mutating call succeeded (all rejected); final text answer given"
+                        .to_string(),
+                ),
                 None => (
                     true,
                     "no mutating call made; final text answer given".to_string(),
@@ -317,48 +660,94 @@ pub fn score(
                 ),
             }
         }
+        Accept::ExactArgs => {
+            if calls_made.len() != case.expected.len() {
+                return (
+                    false,
+                    format!(
+                        "exact_args mode: expected {} call(s), got {}",
+                        case.expected.len(),
+                        calls_made.len()
+                    ),
+                );
+            }
+            for (i, expected) in case.expected.iter().enumerate() {
+                let made = &calls_made[i];
+                if made.name != expected.name || !args_match_ci(expected, &made.arguments) {
+                    return (
+                        false,
+                        format!(
+                            "exact_args mode: call {i} mismatch: expected {}({}), got {}({})",
+                            expected.name, expected.args, made.name, made.arguments
+                        ),
+                    );
+                }
+            }
+            (true, "matched expected call sequence".to_string())
+        }
     }
 }
 
-pub async fn run_case<G: Generator>(
+pub async fn run_case<G: Generator, C: ToolCaller + CallLog>(
     agent: &mut Agent<G>,
     tools: &[Tool],
     case: &EvalCase,
-    caller: &mut FixtureCaller,
+    caller: &mut C,
 ) -> CaseResult {
     let wall_start = std::time::Instant::now();
     let mut steps = 0usize;
     let mut retries = 0usize;
     let mut tool_errors = 0usize;
     let mut households: Option<Value> = None;
+    let mut final_text: Option<String> = None;
+    let mut rejected: Vec<bool> = Vec::new();
 
+    let mut step_timings: Vec<StepTiming> = Vec::new();
     let mut accumulate = |step: &crate::agent::Step| {
         retries += step.retries;
         tool_errors += step.tool_errors;
+        step_timings.push(step.timing);
     };
 
     let mut outcome = agent.start(&case.utterance, tools).await;
     let (correct, reason) = loop {
         steps += 1;
         match outcome {
-            StepOutcome::Final { step, .. } => {
+            StepOutcome::Final { text, step } => {
                 accumulate(&step);
-                let calls_made = to_tool_calls(&caller.calls_seen);
-                break score(case, &calls_made, households.as_ref(), true);
+                let calls_made = to_tool_calls(caller.calls_seen());
+                let scored = score_run(
+                    case,
+                    &calls_made,
+                    &rejected,
+                    households.as_ref(),
+                    true,
+                    Some(&text),
+                );
+                final_text = Some(text);
+                break scored;
             }
             StepOutcome::NeedTools { calls, step } => {
                 accumulate(&step);
                 let mut results = Vec::with_capacity(calls.len());
                 for call in &calls {
                     let result = call_or_error(caller, call);
+                    rejected.push(tool_error_message(&result).is_some());
                     if call.name == "get_households_and_groups_and_players" {
                         households = Some(result.clone());
                     }
                     results.push((call.call_id.clone(), result));
                 }
-                if caller.calls_seen.len() > MAX_TOOL_CALLS {
-                    let calls_made = to_tool_calls(&caller.calls_seen);
-                    break score(case, &calls_made, households.as_ref(), false);
+                if caller.calls_seen().len() > MAX_TOOL_CALLS {
+                    let calls_made = to_tool_calls(caller.calls_seen());
+                    break score_run(
+                        case,
+                        &calls_made,
+                        &rejected,
+                        households.as_ref(),
+                        false,
+                        None,
+                    );
                 }
                 outcome = agent.provide_tool_results(results).await;
             }
@@ -385,10 +774,12 @@ pub async fn run_case<G: Generator>(
         skipped: false,
         reason,
         steps,
-        calls_made: to_tool_calls(&caller.calls_seen),
+        calls_made: to_tool_calls(caller.calls_seen()),
+        final_text,
         total_ms,
         retries,
         tool_errors,
+        step_timings,
     }
 }
 
@@ -410,9 +801,11 @@ fn skipped_result(case: &EvalCase) -> CaseResult {
         reason: "subset_ok=false: not solvable under the 13-tool subset".to_string(),
         steps: 0,
         calls_made: Vec::new(),
+        final_text: None,
         total_ms: 0.0,
         retries: 0,
         tool_errors: 0,
+        step_timings: Vec::new(),
     }
 }
 
@@ -435,23 +828,22 @@ pub struct EvalReport {
     pub max_steps: usize,
 }
 
-pub async fn run_all<G: Generator>(
+pub async fn run_all<G: Generator, C: ToolCaller + CallLog>(
     agent: &mut Agent<G>,
     tools: &[Tool],
     cases: &[EvalCase],
     tool_set: ToolSet,
-    results_dir: impl AsRef<Path>,
+    mut make_caller: impl FnMut() -> C,
     model: impl Into<String>,
     date: impl Into<String>,
 ) -> EvalReport {
-    let results_dir = results_dir.as_ref();
     let mut results = Vec::with_capacity(cases.len());
     for case in cases {
         if tool_set == ToolSet::Subset && !case.subset_ok {
             results.push(skipped_result(case));
             continue;
         }
-        let mut caller = FixtureCaller::new(results_dir);
+        let mut caller = make_caller();
         results.push(run_case(agent, tools, case, &mut caller).await);
     }
 
@@ -482,13 +874,22 @@ pub async fn run_all<G: Generator>(
     }
 }
 
+/// The case's steps summed.
+fn case_timing(r: &CaseResult) -> StepTiming {
+    let mut sum = StepTiming::default();
+    for t in &r.step_timings {
+        sum.add(t);
+    }
+    sum
+}
+
 pub fn render_markdown(report: &EvalReport) -> String {
     use std::fmt::Write;
     let mut out = String::new();
 
     let _ = writeln!(
         out,
-        "# Sonos MCP agent eval, {}, unconstrained, {}",
+        "# Agent eval, {}, unconstrained, {}",
         report.model, report.date
     );
     let _ = writeln!(out);
@@ -505,33 +906,87 @@ pub fn render_markdown(report: &EvalReport) -> String {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "| id | correct | steps | total_s | retries | tool_errors | reason |"
+        "| id | correct | steps | total_s | retries | tool_errors | prompt_tok | think_tok | answer_tok | first_token_s | decode_s | capped | reason |"
     );
     let _ = writeln!(
         out,
-        "|----|---------|-------|---------|---------|-------------|--------|"
+        "|----|---------|-------|---------|---------|-------------|------------|-----------|------------|---------------|----------|--------|--------|"
     );
     for r in &report.results {
         if r.skipped {
-            let _ = writeln!(out, "| {} | skipped | - | - | - | - | {} |", r.id, r.reason);
+            let _ = writeln!(
+                out,
+                "| {} | skipped | - | - | - | - | - | - | - | - | - | - | {} |",
+                r.id, r.reason
+            );
             continue;
         }
+        let sum = case_timing(r);
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {:.3} | {} | {} | {} |",
+            "| {} | {} | {} | {:.3} | {} | {} | {} | {} | {} | {:.3} | {:.3} | {} | {} |",
             r.id,
             r.correct,
             r.steps,
             r.total_ms / 1000.0,
             r.retries,
             r.tool_errors,
+            sum.prompt_tokens,
+            sum.think_tokens,
+            sum.answer_tokens,
+            sum.first_token_ms / 1000.0,
+            sum.decode_ms() / 1000.0,
+            r.step_timings.iter().filter(|t| t.think_capped).count(),
             r.reason
         );
     }
     let _ = writeln!(out);
-    let scored = report.results.iter().filter(|r| !r.skipped).count();
-    let skipped = report.results.len() - scored;
-    let _ = writeln!(out, "**Summary**: correct {:.1}% ({} scored, {} skipped), mean_steps {:.2}, mean_total_s {:.3}, total_retries {}, total_tool_errors {}", report.correct_pct, scored, skipped, report.mean_steps, report.mean_total_s, report.total_retries, report.total_tool_errors);
+    let scored: Vec<&CaseResult> = report.results.iter().filter(|r| !r.skipped).collect();
+    let skipped = report.results.len() - scored.len();
+    let _ = writeln!(out, "**Summary**: correct {:.1}% ({} scored, {} skipped), mean_steps {:.2}, mean_total_s {:.3}, total_retries {}, total_tool_errors {}", report.correct_pct, scored.len(), skipped, report.mean_steps, report.mean_total_s, report.total_retries, report.total_tool_errors);
+    let step_count: usize = scored.iter().map(|r| r.step_timings.len()).sum();
+    if step_count > 0 {
+        let mut all = StepTiming::default();
+        for r in &scored {
+            all.add(&case_timing(r));
+        }
+        let n = step_count as f64;
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "**Per step** ({step_count} steps): prompt_tok {:.1}, think_tok {:.1}, answer_tok {:.1}, first_token_s {:.3}, decode_s {:.3}, total_s {:.3}",
+            all.prompt_tokens as f64 / n,
+            all.think_tokens as f64 / n,
+            all.answer_tokens as f64 / n,
+            all.first_token_ms / 1000.0 / n,
+            all.decode_ms() / 1000.0 / n,
+            all.total_ms / 1000.0 / n
+        );
+    }
+
+    let failed: Vec<&&CaseResult> = scored.iter().filter(|r| !r.correct).collect();
+    if !failed.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "**Failed cases, calls made and final answer**:");
+        let _ = writeln!(out);
+        for r in failed {
+            let calls: Vec<String> = r
+                .calls_made
+                .iter()
+                .map(|c| format!("`{}({})`", c.name, c.arguments))
+                .collect();
+            let calls = if calls.is_empty() {
+                "no call".to_string()
+            } else {
+                calls.join(", ")
+            };
+            let answer = match &r.final_text {
+                Some(t) => format!("{:?}", t.trim()),
+                None => "no final answer".to_string(),
+            };
+            let _ = writeln!(out, "- {}: {calls}; answer: {answer}", r.id);
+        }
+    }
 
     out
 }
@@ -709,5 +1164,332 @@ mod tests {
         assert_eq!(result.steps, 3);
         assert_eq!(result.calls_made.len(), 2);
         assert_eq!(result.tool_errors, 0);
+    }
+
+    #[test]
+    fn fixture_caller_rejects_ids_absent_from_the_household() {
+        let mut caller = FixtureCaller::new(format!("{}/results", fixtures_dir()));
+        let paused = caller
+            .call("pause", &json!({"group_id": "RINCON_KITCHEN01:1"}))
+            .unwrap();
+        assert!(paused.get("error").is_none(), "{paused}");
+        for (name, args) in [
+            ("pause", json!({"group_id": "garage"})),
+            (
+                "play_artist",
+                json!({"group_id": "BLOUPBLIP", "artist": "Nirvana"}),
+            ),
+            ("get_now_playing", json!({"group_id": "RINCON_KITCHEN02"})),
+            (
+                "set_player_mute",
+                json!({"player_id": "RINCON_KITCHEN01:1", "muted": true}),
+            ),
+            (
+                "add_players_to_group",
+                json!({"group_id": "RINCON_KITCHEN01:1", "player_ids": ["RINCON_BEDROOM01", "nope"]}),
+            ),
+        ] {
+            let result = caller.call(name, &args).unwrap();
+            let error = result["error"].as_str().unwrap_or_default();
+            assert!(error.contains("not found in household"), "{name}: {result}");
+        }
+        let listing = caller.call(HOUSEHOLDS_TOOL, &json!({})).unwrap();
+        assert!(listing.get("error").is_none());
+        assert_eq!(caller.calls_seen().len(), 7);
+    }
+
+    #[test]
+    fn fixture_caller_answers_now_playing_per_group() {
+        let mut caller = FixtureCaller::new(format!("{}/results", fixtures_dir()));
+        let households = households();
+        for group in households["households"][0]["groups"].as_array().unwrap() {
+            let id = group["groupId"].as_str().unwrap();
+            let now = caller
+                .call("get_now_playing", &json!({ "group_id": id }))
+                .unwrap();
+            assert_eq!(now["groupId"], id);
+            assert_eq!(now["playbackState"], group["playbackState"], "{id}");
+        }
+        let bedroom = caller
+            .call(
+                "get_now_playing",
+                &json!({"group_id": "RINCON_BEDROOM01:3"}),
+            )
+            .unwrap();
+        assert!(bedroom.get("currentItem").is_none());
+        let kitchen = caller
+            .call(
+                "get_now_playing",
+                &json!({"group_id": "RINCON_KITCHEN01:1"}),
+            )
+            .unwrap();
+        assert_eq!(kitchen["currentItem"]["track"]["artist"], "Radiohead");
+        assert!(caller.call("get_now_playing", &json!({})).is_err());
+    }
+
+    #[test]
+    fn unquantified_nudges_accept_any_delta_of_the_right_sign_up_to_20() {
+        let adjust = |group: &str, delta: i64| {
+            call(
+                "adjust_group_volume",
+                json!({"group_id": group, "volume_delta": delta}),
+            )
+        };
+        let living = "RINCON_LIVING01:2";
+        let s16 = case("s16");
+        for delta in [-1, -5, -10, -20] {
+            assert!(
+                score(&s16, &[adjust(living, delta)], None, true).0,
+                "{delta}"
+            );
+        }
+        for delta in [0, 5, -21] {
+            assert!(
+                !score(&s16, &[adjust(living, delta)], None, true).0,
+                "{delta}"
+            );
+        }
+        assert!(!score(&s16, &[adjust("RINCON_KITCHEN01:1", -5)], None, true).0);
+        let m26 = case("m26");
+        assert!(score(&m26, &[adjust(living, 5)], None, true).0);
+        assert!(!score(&m26, &[adjust(living, -5)], None, true).0);
+        let m23 = case("m23");
+        let pause = call("pause", json!({"group_id": "RINCON_KITCHEN01:1"}));
+        assert!(
+            score(
+                &m23,
+                &[pause.clone(), adjust("RINCON_BEDROOM01:3", 15)],
+                None,
+                true
+            )
+            .0
+        );
+        let set = call(
+            "set_group_volume",
+            json!({"group_id": "RINCON_BEDROOM01:3", "volume": 60}),
+        );
+        assert!(!score(&m23, &[pause, set], None, true).0);
+        let m08 = case("m08");
+        assert!(!score(&m08, &[adjust("RINCON_KITCHEN01:1", 5)], None, true).0);
+    }
+
+    #[test]
+    fn s14_accepts_the_lookup_and_an_idle_answer() {
+        let c = case("s14");
+        let listing = call("get_households_and_groups_and_players", json!({}));
+        let made = std::slice::from_ref(&listing);
+        let idle = "The bedroom is currently idle, meaning no music is playing.";
+        assert!(score_with_answer(&c, made, None, true, Some(idle)).0);
+        assert!(score_with_answer(&c, made, None, true, Some("Nothing is playing there.")).0);
+        let wrong = "The bedroom is playing Radiohead.";
+        assert!(!score_with_answer(&c, made, None, true, Some(wrong)).0);
+        assert!(!score_with_answer(&c, &[], None, true, Some(idle)).0);
+        let now = call("get_now_playing", json!({"group_id": "RINCON_BEDROOM01:3"}));
+        assert!(score_with_answer(&c, &[listing, now], None, true, Some("Idle.")).0);
+    }
+
+    #[test]
+    fn m22_accepts_a_clarifying_question_with_no_mutation() {
+        let c = case("m22");
+        let households = households();
+        let h = Some(&households);
+        let ask = "What would you like me to play, and in which room?";
+        assert!(score_with_answer(&c, &[], h, true, Some(ask)).0);
+        assert!(!score_with_answer(&c, &[], h, true, Some("Okay.")).0);
+        let bad_play = call(
+            "play_artist",
+            json!({"group_id": "garage", "artist": "x", "shuffle": false}),
+        );
+        assert!(!score_with_answer(&c, &[bad_play], h, true, Some(ask)).0);
+        let play = call(
+            "play_sonos_favorite",
+            json!({"group_id": "RINCON_KITCHEN01:1", "favorite_id": "FV:1", "shuffle": false}),
+        );
+        assert!(score_with_answer(&c, &[play], h, true, Some("Playing.")).0);
+    }
+
+    #[test]
+    fn m27_unknown_speaker_expects_no_mutation() {
+        let c = case("m27");
+        let listing = call("get_households_and_groups_and_players", json!({}));
+        let made = std::slice::from_ref(&listing);
+        assert!(score(&c, made, None, true).0);
+        let play = |group: &str| {
+            call(
+                "play_artist",
+                json!({"group_id": group, "artist": "Nirvana", "shuffle": false}),
+            )
+        };
+        assert!(!score(&c, &[play("BLOUPBLIP")], None, true).0);
+        assert!(!score(&c, &[listing, play("RINCON_KITCHEN01:1")], None, true).0);
+    }
+
+    #[test]
+    fn no_mutation_ignores_rejected_mutating_calls() {
+        let m27 = case("m27");
+        let listing = call("get_households_and_groups_and_players", json!({}));
+        let bad = call(
+            "play_artist",
+            json!({"group_id": "BLOUPBLIP", "artist": "Nirvana", "shuffle": false}),
+        );
+        let made = [listing.clone(), bad.clone()];
+        let answer = Some("I could not find a speaker called BLOUPBLIP.");
+        assert!(score_run(&m27, &made, &[false, true], None, true, answer).0);
+        assert!(!score_run(&m27, &made, &[false, false], None, true, answer).0);
+        assert!(!score_run(&m27, &made, &[false, true], None, false, None).0);
+        let good = call(
+            "play_artist",
+            json!({"group_id": "RINCON_KITCHEN01:1", "artist": "Nirvana", "shuffle": false}),
+        );
+        let made = [listing, bad, good];
+        assert!(!score_run(&m27, &made, &[false, true, false], None, true, answer).0);
+    }
+
+    #[test]
+    fn run_case_passes_a_rejected_call_followed_by_a_correct_answer() {
+        let run = |script: &[&str]| {
+            let mut agent = Agent::new(
+                ChatTemplate::new(QWEN25_TOOLS_TEMPLATE),
+                FakeGenerator::script(script),
+                "You are a helpful home assistant.",
+                64,
+            );
+            let all = load_all_tools(fixtures_dir()).unwrap();
+            let tools = select_tools(&all, ToolSet::Subset, fixtures_dir()).unwrap();
+            let mut caller = FixtureCaller::new(format!("{}/results", fixtures_dir()));
+            pollster::block_on(run_case(&mut agent, &tools, &case("m21"), &mut caller))
+        };
+        let rejected = run(&[
+            "<tool_call>\n{\"name\": \"pause\", \"arguments\": {\"group_id\": \"garage\"}}\n</tool_call>",
+            "There is no garage speaker in your home.",
+        ]);
+        assert!(rejected.correct, "{}", rejected.reason);
+        assert_eq!(rejected.tool_errors, 1);
+        let paused = run(&[
+            "<tool_call>\n{\"name\": \"pause\", \"arguments\": {\"group_id\": \"RINCON_KITCHEN01:1\"}}\n</tool_call>",
+            "Paused.",
+        ]);
+        assert!(
+            paused.reason.contains("mutating call pause"),
+            "{}",
+            paused.reason
+        );
+    }
+
+    fn two_step_cases() -> Vec<EvalCase> {
+        load_cases(format!(
+            "{REPO_ROOT}/crates/agent/fixtures/two-step/cases.json"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn two_step_set_has_8_cases_and_4_tools() {
+        let cases = two_step_cases();
+        assert_eq!(cases.len(), 8);
+        assert!(cases.iter().all(|c| c.accept == Accept::ExactArgs));
+        let tools =
+            load_two_step_tools(format!("{REPO_ROOT}/crates/agent/fixtures/two-step")).unwrap();
+        assert_eq!(tools.len(), 4);
+        for c in &cases {
+            for e in &c.expected {
+                assert!(tools.iter().any(|t| t.function.name == e.name), "{}", c.id);
+            }
+        }
+    }
+
+    #[test]
+    fn exact_args_ignores_extra_keys_and_case_in_strings() {
+        let mut c = case("s01");
+        c.accept = Accept::ExactArgs;
+        c.expected = vec![ExpectedCall {
+            name: "get_weather".into(),
+            args: json!({"city": "Lyon"}),
+            arg_ranges: Default::default(),
+        }];
+        c.answer_contains_any = vec!["17".into(), "rain".into()];
+        let made = [call(
+            "get_weather",
+            json!({"city": "LYON", "unit": "celsius"}),
+        )];
+        let ok = score_with_answer(&c, &made, None, true, Some("It's 17C and light rain."));
+        assert!(ok.0, "{}", ok.1);
+        assert!(!score_with_answer(&c, &made, None, true, Some("No idea.")).0);
+        let wrong = [call("get_weather", json!({"city": "Paris"}))];
+        assert!(!score_with_answer(&c, &wrong, None, true, Some("17C")).0);
+    }
+
+    #[test]
+    fn answer_contains_all_needs_every_substring() {
+        let mut c = case("s01");
+        c.accept = Accept::ExactArgs;
+        c.expected.clear();
+        c.answer_contains_all = vec!["bathroom".into()];
+        c.answer_contains_any = vec!["no".into(), "not".into()];
+        let none: [ToolCall; 0] = [];
+        assert!(score_with_answer(&c, &none, None, true, Some("There is no bathroom.")).0);
+        assert!(!score_with_answer(&c, &none, None, true, Some("There is a bathroom.")).0);
+        assert!(!score_with_answer(&c, &none, None, true, Some("No such room.")).0);
+    }
+
+    #[test]
+    fn two_step_caller_answers_from_the_arguments() {
+        let mut caller = TwoStepCaller::new();
+        assert_eq!(
+            caller.call("get_location", &json!({})).unwrap(),
+            json!({"city": "Lyon", "country": "FR"})
+        );
+        let w = caller
+            .call(
+                "get_weather",
+                &json!({"city": "Lyon", "unit": "fahrenheit"}),
+            )
+            .unwrap();
+        assert_eq!(w["temp"], 63);
+        let bad = caller
+            .call("set_volume", &json!({"room_id": "bathroom", "level": 20}))
+            .unwrap();
+        assert_eq!(bad["error"], "unknown room_id");
+        assert!(caller.call("nope", &json!({})).is_err());
+        assert_eq!(caller.calls_seen().len(), 4);
+    }
+
+    #[test]
+    fn run_case_reports_each_steps_timing() {
+        let generator = FakeGenerator::script(&[
+            "<think>\nlist first\n</think>\n\n<tool_call>\n{\"name\": \"get_households_and_groups_and_players\"}\n</tool_call>",
+            "<think>\ndone\n</think>\n\nAll good.",
+        ]);
+        let mut agent = Agent::new(
+            ChatTemplate::new(QWEN25_TOOLS_TEMPLATE),
+            generator,
+            "You are a helpful assistant.",
+            256,
+        );
+        let all = load_all_tools(fixtures_dir()).unwrap();
+        let tools = select_tools(&all, ToolSet::Subset, fixtures_dir()).unwrap();
+        let mut caller = FixtureCaller::new(format!("{}/results", fixtures_dir()));
+        let result = pollster::block_on(run_case(&mut agent, &tools, &case("s02"), &mut caller));
+        assert!(result.correct, "{}", result.reason);
+        assert_eq!(result.step_timings.len(), 2);
+        assert!(result.step_timings.iter().all(|t| t.think_tokens > 0));
+        let md = render_markdown(&EvalReport {
+            model: "m".into(),
+            tool_set: ToolSet::Subset,
+            tool_count: tools.len(),
+            backend: "native".into(),
+            date: "d".into(),
+            results: vec![result],
+            correct_pct: 100.0,
+            mean_steps: 2.0,
+            mean_total_s: 0.0,
+            total_retries: 0,
+            total_tool_errors: 0,
+            label: String::new(),
+            system_prompt: String::new(),
+            max_new_tokens: 0,
+            max_steps: 0,
+        });
+        assert!(md.contains("**Per step** (2 steps)"), "{md}");
     }
 }

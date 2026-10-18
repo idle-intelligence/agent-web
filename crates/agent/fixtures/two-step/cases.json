@@ -1,0 +1,102 @@
+[
+  {
+    "id": "t01",
+    "utterance": "What's 2 + 2?",
+    "kind": "no_call",
+    "expected": [],
+    "accept": "exact_args",
+    "subset_ok": true,
+    "answer_contains_any": ["4"],
+    "notes": "Arithmetic needs no tool; a correct run makes zero calls and answers 4."
+  },
+  {
+    "id": "t02",
+    "utterance": "What's the weather in Paris?",
+    "kind": "single",
+    "expected": [
+      { "name": "get_weather", "args": { "city": "Paris" } }
+    ],
+    "accept": "exact_args",
+    "subset_ok": true,
+    "answer_contains_any": ["17", "rain"],
+    "notes": "City is named directly, so get_location is never needed. unit is omitted (celsius default); the mock always returns condition 'light rain', so either the 17 or the condition in the answer is accepted."
+  },
+  {
+    "id": "t03",
+    "utterance": "What's the weather where I am?",
+    "kind": "chained",
+    "expected": [
+      { "name": "get_location", "args": {} },
+      { "name": "get_weather", "args": { "city": "Lyon" } }
+    ],
+    "accept": "exact_args",
+    "subset_ok": true,
+    "answer_contains_any": ["17", "rain"],
+    "notes": "No city named; get_location must run first and its result (Lyon) must be threaded into get_weather's city argument."
+  },
+  {
+    "id": "t04",
+    "utterance": "Is it raining here?",
+    "kind": "chained",
+    "expected": [
+      { "name": "get_location", "args": {} },
+      { "name": "get_weather", "args": { "city": "Lyon" } }
+    ],
+    "accept": "exact_args",
+    "subset_ok": true,
+    "answer_contains_any": ["yes", "rain"],
+    "notes": "Same chain as t03, phrased as a yes/no question; the mock condition is always 'light rain', so the correct answer is affirmative."
+  },
+  {
+    "id": "t05",
+    "utterance": "What's the temperature here in Fahrenheit?",
+    "kind": "chained",
+    "expected": [
+      { "name": "get_location", "args": {} },
+      { "name": "get_weather", "args": { "city": "Lyon", "unit": "fahrenheit" } }
+    ],
+    "accept": "exact_args",
+    "subset_ok": true,
+    "answer_contains_any": ["63"],
+    "notes": "Same chain as t03/t04, with an explicit unit that must be carried through to get_weather's arguments; the mock returns 63 for fahrenheit (17 C)."
+  },
+  {
+    "id": "t06",
+    "utterance": "Set the kitchen to 30.",
+    "kind": "chained",
+    "expected": [
+      { "name": "list_rooms", "args": {} },
+      { "name": "set_volume", "args": { "room_id": "RINCON_K1", "level": 30 } }
+    ],
+    "accept": "exact_args",
+    "subset_ok": true,
+    "answer_contains_any": ["30"],
+    "notes": "The room name must be resolved to its ID via list_rooms before set_volume; the room's ID is not guessable without that call."
+  },
+  {
+    "id": "t07",
+    "utterance": "Turn the living room down to 10.",
+    "kind": "chained",
+    "expected": [
+      { "name": "list_rooms", "args": {} },
+      { "name": "set_volume", "args": { "room_id": "RINCON_L2", "level": 10 } }
+    ],
+    "accept": "exact_args",
+    "subset_ok": true,
+    "answer_contains_any": ["10"],
+    "notes": "Same chain as t06 for a different room; 'turn down to' still means an absolute level, not a relative decrease."
+  },
+  {
+    "id": "t08",
+    "utterance": "Set the bathroom to 20.",
+    "kind": "no_match",
+    "expected": [
+      { "name": "list_rooms", "args": {} }
+    ],
+    "accept": "exact_args",
+    "subset_ok": true,
+    "answer_contains_all": ["bathroom"],
+    "answer_contains_any": ["no", "not", "don't", "doesn't", "isn't", "unknown", "any"],
+    "notes": "There is no room named bathroom in list_rooms' result. The correct run calls list_rooms, finds no match, and says so in plain text instead of guessing a room_id or calling set_volume with one (a set_volume call, even one that errors, is a fail here: the model should have known not to call it from list_rooms' result)."
+  }
+]

@@ -1,12 +1,32 @@
 {
-  "groupId": "RINCON_KITCHEN01:1",
-  "playbackState": "PLAYING",
-  "currentItem": {
-    "track": {
-      "name": "Everything In Its Right Place",
-      "artist": "Radiohead",
-      "album": "Kid A",
-      "durationMillis": 249000
+  "by_group_id": {
+    "RINCON_KITCHEN01:1": {
+      "groupId": "RINCON_KITCHEN01:1",
+      "playbackState": "PAUSED",
+      "currentItem": {
+        "track": {
+          "name": "Everything In Its Right Place",
+          "artist": "Radiohead",
+          "album": "Kid A",
+          "durationMillis": 249000
+        }
+      }
+    },
+    "RINCON_LIVING01:2": {
+      "groupId": "RINCON_LIVING01:2",
+      "playbackState": "PLAYING",
+      "currentItem": {
+        "track": {
+          "name": "So What",
+          "artist": "Miles Davis",
+          "album": "Kind of Blue",
+          "durationMillis": 562000
+        }
+      }
+    },
+    "RINCON_BEDROOM01:3": {
+      "groupId": "RINCON_BEDROOM01:3",
+      "playbackState": "IDLE"
     }
   }
 }
