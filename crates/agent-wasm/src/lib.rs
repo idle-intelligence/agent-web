@@ -10,13 +10,12 @@
 //!
 //! - `{"type": "needTools", "calls": [{"callId", "name", "arguments"}], "timing": T}`
 //! - `{"type": "final", "text": "...", "timing": T}`
-//!
-//! where `T` is `{"promptTokens", "thinkTokens", "answerTokens"}`, the
-//! token counts of the step (0 when the generator cannot count).
-//!
 //! - `{"type": "contextOverflow", "needed": n, "available": n}`
 //! - `{"type": "aborted"}`
 //! - `{"type": "error", "message": "..."}`
+//!
+//! `T` is `{"promptTokens", "thinkTokens", "answerTokens"}`, the token
+//! counts of the step.
 //!
 //! Run it in a Web Worker. While `start` or `provideToolResults` is
 //! running, the agent is busy: any other call that needs it (a second
