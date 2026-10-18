@@ -471,3 +471,91 @@ Data: `sonos-default-server-fixture.md`, `sonos-clear-server-fixture.md`,
   `set_group_volume` on the bedroom (70, 50 then 60, and 50 in the three
   runs), and m26 looks the room up and asks what to do without a volume
   call. m08 still uses `set_group_volume` for "by 10".
+
+## Rejected mutating calls no longer count as mutations
+
+In `no_mutation` cases (m21, m27, and m22's alternative), a mutating call
+counted as a mutation even when the fixture rejected it with an error
+result (unknown group or player id). The scorer now counts only mutating
+calls whose result was not an error: such a case passes when no mutating
+call succeeded, the run ended in a text answer, and the answer checks (if
+any) pass. A rejected call changed nothing on the household, so trying an
+id, getting the not-found error and then answering correctly is a pass. The
+rule is the same for every case; the run loop records which calls returned
+an error (`tool_error_message`, as the agent itself uses) and passes that
+to the scorer. The other acceptance modes are unchanged.
+
+### Parameters
+
+Same as the server-like fixture runs above (Qwen3-1.7B Q8_0, thinking on,
+greedy, `max_new_tokens` 1024, `max_steps` 6, `max_ctx` 4096, 33 scored
+cases, the 13-tool subset, same fixture and case file apart from the notes
+of m21 and m27), with these differences:
+
+| parameter | value |
+|---|---|
+| agent-web | c8c6e63 (scoring change) |
+| engine source | llm-web `rep-penalty-hf` at e7bf205 through the same local `cargo --config` patch of `lean`, `lean-core` and `lean-chat`; no tracked edits at build time. The branch's change over cc92176 is the repetition penalty, which greedy decoding with no penalty does not use |
+| backend | `webgpu` (native, Metal) in all three runs, from the binary's `backend:` line |
+| runs | one after the other, each started when the 1-minute load average was below 3 and no rustc or cargo was running, under the GPU lock |
+
+| run | load at start | load at end |
+|---|---|---|
+| Sonos default | 2.42 2.56 2.82 | 2.07 2.62 3.10 |
+| Sonos clear | 2.07 2.62 3.10 | 2.09 1.86 1.82 |
+| Sonos clear, cap 512 | 2.09 1.86 1.82 | 1.48 1.74 1.99 |
+
+### Pass rate
+
+"before" is the server-like fixture run above (bcf446b, cc92176 engine
+code); "now" is this run.
+
+| family (cases) | default, before | default, now | clear, before | clear, now | clear cap 512, before | clear cap 512, now |
+|---|---|---|---|---|---|---|
+| single (14) | 11/14 | 11/14 | 11/14 | 11/14 | 12/14 | 12/14 |
+| multi (17) | 10/17 | 11/17 | 12/17 | 14/17 | 13/17 | 15/17 |
+| multi-fr (2) | 1/2 | 1/2 | 1/2 | 1/2 | 1/2 | 1/2 |
+| all (33) | 22/33 = 66.7% | 23/33 = 69.7% | 24/33 = 72.7% | 26/33 = 78.8% | 26/33 = 78.8% | 28/33 = 84.8% |
+
+### Cases whose outcome changed
+
+| id | default | clear | clear, cap 512 | reason given by the scorer now |
+|---|---|---|---|---|
+| m27 | fail to pass | fail to pass | fail to pass | no mutating call succeeded (all rejected); final text answer given |
+| m21 | fail (unchanged) | fail to pass | fail to pass | clear and capped: as m27. default: `pause(LIVING)` was made, after the lookup, and succeeded |
+
+### Tokens and time per step
+
+| run | steps | prompt_tok | think_tok | answer_tok | first_token_s | decode_s | total_s | steps per case | mean_total_s | retries | tool errors |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Sonos default | 90 | 2828.5 | 493.2 | 40.4 | 2.306 | 27.486 | 29.792 | 2.73 | 81.29 | 12 | 1 |
+| Sonos clear | 93 | 2686.9 | 418.4 | 39.1 | 2.126 | 22.565 | 24.691 | 2.85 | 74.60 | 7 | 3 |
+| Sonos clear, cap 512 | 94 | 2730.5 | 351.2 | 41.0 | 2.092 | 17.600 | 19.692 | 2.85 | 56.11 | 8 | 3 |
+
+Data: `sonos-default-rejected-calls.md`, `sonos-clear-rejected-calls.md`,
+`sonos-clear-cap512-rejected-calls.md`.
+
+### Observations
+
+- Every case has the same steps, retries, tool errors, capped steps and
+  prompt, thinking and answer token counts as the server-like fixture run
+  of the same configuration (per-case diff of those columns of the two
+  reports is empty), so the model produced the same output on the e7bf205
+  engine as on cc92176. All outcome changes come from the scoring change.
+- m27 passes in all three configurations: as in the runs above, the model calls `play_artist`
+  on `"BLOUPBLIP"`, gets the not-found error, looks the household up and
+  answers that the speaker does not exist. m21 passes with the clear
+  prompt, with and without the cap, on the same pattern with
+  `pause("garage")`. With the default prompt m21 still fails: after the
+  lookup the model pauses the living room, a mutation that succeeded.
+- Totals rise by 1 (default, 22 to 23), 2 (clear, 24 to 26) and 2 (clear
+  with cap 512, 26 to 28) of 33. No case went from pass to fail.
+- m22 is unaffected: it passes through its alternative in all three runs
+  with no mutating call at all. s15 still fails in all three runs: its
+  rejected `get_now_playing("default")` is a read, not a mutation, and the
+  case requires `get_now_playing(LIVING)`, which is never called.
+- The times per step are 1.12 to 1.19 times those of the server-like
+  fixture runs for the same tokens (total_s 29.79 against 25.42, 24.69
+  against 20.75, 19.69 against 17.63), under similar load averages; the two
+  sets of runs used different engine builds and were not interleaved, so
+  this is not a measured engine difference.
