@@ -38,3 +38,7 @@ required-features = ["lean"]
 [[test]]
 name = "agent_live"
 required-features = ["lean"]
+
+[[test]]
+name = "prefix_image_live"
+required-features = ["lean"]

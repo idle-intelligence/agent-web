@@ -611,6 +611,32 @@ impl<G: Generator> Agent<G> {
         &self.generator
     }
 
+    pub(crate) fn generator_mut(&mut self) -> &mut G {
+        &mut self.generator
+    }
+
+    /// The text every first prompt of a turn with `tools` starts with: the
+    /// system prompt and the tools through the chat template, up to where
+    /// the user's words begin. It is the part of the prompt an engine can
+    /// keep cached from one turn to the next, whatever the utterance.
+    /// Found as the common prefix of two renders that differ only in the
+    /// user's words, so it holds for any template.
+    pub fn prompt_prefix(&self, tools: &[Tool]) -> Result<String> {
+        let render = |words: &str| {
+            render_prompt(
+                &self.template,
+                &[Message::system(&self.system_prompt), Message::user(words)],
+                tools,
+            )
+        };
+        let (a, b) = (render("a")?, render("b")?);
+        let mut n = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+        while !a.is_char_boundary(n) {
+            n -= 1;
+        }
+        Ok(a[..n].to_string())
+    }
+
     pub fn set_max_steps(&mut self, max_steps: usize) {
         self.max_steps = max_steps;
     }
@@ -1892,5 +1918,34 @@ mod tests {
         };
         assert!(!step.timing.think_capped);
         assert_eq!(budgets.borrow().len(), 1);
+    }
+
+    #[test]
+    fn prompt_prefix_is_where_every_first_prompt_starts() {
+        for template in [QWEN25_TOOLS_TEMPLATE, QWEN3_TEMPLATE] {
+            let generator = FakeGenerator::script(&["It is sunny.", "It is sunny."]);
+            let prompts = generator.prompts();
+            let mut agent = Agent::new(
+                ChatTemplate::new(template),
+                generator,
+                "You are a helpful assistant.",
+                64,
+            );
+            agent.set_thinking(Thinking::Off);
+            let prefix = agent.prompt_prefix(&[weather_tool()]).unwrap();
+            assert!(prefix.contains("You are a helpful assistant."));
+            assert!(prefix.contains("\"name\": \"get_weather\""));
+            assert!(prefix.ends_with("<|im_start|>user\n"), "{prefix:?}");
+            start(&mut agent);
+            pollster::block_on(agent.start("Is it raining in Lyon?", &[weather_tool()]));
+            for prompt in prompts.borrow().iter() {
+                assert!(prompt.starts_with(&prefix));
+            }
+            assert_ne!(
+                prefix,
+                agent.prompt_prefix(&[]).unwrap(),
+                "the tools are part of the prefix"
+            );
+        }
     }
 }

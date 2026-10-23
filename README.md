@@ -9,6 +9,7 @@ lean runs the model: text in, text out, on a backend it picks by capability (Web
 - Renders each step's prompt with the model's own chat template and the tools, through lean-chat. For Qwen2.5-Instruct that is `<tools>...</tools>` in the system turn and `<tool_call>{"name":..., "arguments":...}</tool_call>` in the model's output. The `fixture_parity_agent_tools` test checks the prompts byte for byte against `transformers.apply_chat_template(..., tools=...)`.
 - Parses the model's tool calls out of its raw output, and regenerates when a reply is malformed, calls an unknown tool, or repeats a call.
 - Drives a step-wise loop: render the prompt, generate, parse, hand back the pending tool calls, take their results, and repeat until a final text answer.
+- Prefills the part of the prompt every turn starts with (the system prompt and the tools) before the first utterance, and saves or restores its KV cache as a lean prefix image, so a later session skips that prefill: `prefill`, `prefix_key`, `save_prefix` and `restore_prefix` on an agent over lean (JS: `prefill`, `prefixKey`, `savePrefix`, `restorePrefix`). Where images are kept is the caller's choice.
 - Scores runs against a fixed set of utterance cases for a Sonos speaker-control tool set, under four acceptance modes: exact call sequence, required calls in order, no mutating call, any valid play call.
 
 ## Crates
@@ -40,6 +41,14 @@ The tests that need the model files are ignored by default. With the files above
 LEAN_GGUF_QWEN25_3B=$PWD/models/Qwen2.5-3B-Instruct-GGUF/qwen2.5-3b-instruct-q4_0.gguf \
 LEAN_TOKENIZER_DIR_QWEN25_3B=$PWD/models/Qwen2.5-3B-Instruct \
 cargo test -p agent --release -- --ignored
+```
+
+`prefix_image_live` checks prefix images on Qwen3-1.7B with the Sonos tools subset: a restored image gives the same greedy reply as a fresh agent, and an image saved for another tools list is refused. It needs the Qwen3-1.7B Q8_0 GGUF from [Qwen/Qwen3-1.7B-GGUF](https://huggingface.co/Qwen/Qwen3-1.7B-GGUF) and the tokenizer files from [Qwen/Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B):
+
+```sh
+LEAN_GGUF_QWEN3_1_7B=$PWD/models/Qwen3-1.7B-GGUF/Qwen3-1.7B-Q8_0.gguf \
+LEAN_TOKENIZER_DIR_QWEN3_1_7B=$PWD/models/Qwen3-1.7B \
+cargo test -p agent --release --test prefix_image_live -- --ignored --nocapture
 ```
 
 The wasm package (needs [wasm-pack](https://rustwasm.github.io/wasm-pack/)) is built into `_site/pkg` by:
