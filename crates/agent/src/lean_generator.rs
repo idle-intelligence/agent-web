@@ -73,6 +73,7 @@ impl Generator for LeanGenerator {
             Err(LeanError::ContextOverflow { needed, available }) => {
                 Err(GenerateError::ContextOverflow { needed, available })
             }
+            Err(e @ LeanError::PrefixImage(_)) => Err(GenerateError::Other(e.into())),
             Err(LeanError::Other(e)) => Err(GenerateError::Other(e)),
         }
     }
