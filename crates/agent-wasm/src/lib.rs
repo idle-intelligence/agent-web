@@ -17,20 +17,29 @@
 //! `T` is `{"promptTokens", "thinkTokens", "answerTokens"}`, the token
 //! counts of the step.
 //!
-//! Run it in a Web Worker. While `start` or `provideToolResults` is
-//! running, the agent is busy: any other call that needs it (a second
-//! `start`, `provideToolResults`, `setOnText`, `reset`) throws an "agent is
-//! busy" error. `backend` and `abortHandle()` always work; stop a running
-//! step through the handle.
+//! Run it in a Web Worker. While `start`, `provideToolResults`, `prefill`
+//! or `savePrefix` is running, the agent is busy: any other call that
+//! needs it (a second `start`, `provideToolResults`, `setOnText`, `reset`,
+//! the prefix calls) throws an "agent is busy" error. `backend` and
+//! `abortHandle()` always work; stop a running step through the handle.
+//!
+//! The system prompt and the tools, the part of the prompt every turn
+//! starts with, can be prefilled before the first utterance (`prefill`)
+//! and their KV cache saved and restored as a lean prefix image
+//! (`prefixKey`, `savePrefix`, `restorePrefix`), so a later session skips
+//! that prefill. Where the image is kept is the page's choice.
 
 use std::cell::RefCell;
+use std::io::{Read, Write};
 
 use wasm_bindgen::prelude::*;
 
-use agent::agent::{AbortFlag, Agent, PendingToolCall, Step, StepOutcome, Thinking};
+use agent::agent::{
+    tools_from_mcp, AbortFlag, Agent, PendingToolCall, Step, StepOutcome, Thinking, Tool,
+};
 use agent::lean_generator::LeanGenerator;
 use anyhow::Result;
-use lean::{Backend, GgufSource, LoadOptions, TokenizerSource};
+use lean::{Backend, GgufSource, LeanError, LoadOptions, PrefixImageError, TokenizerSource};
 use serde_json::Value;
 
 /// Token counts of a step, as the `timing` field of `needTools` and
@@ -63,6 +72,111 @@ fn outcome_to_json(outcome: StepOutcome) -> String {
         StepOutcome::Error { message, .. } => {
             serde_json::json!({"type": "error", "message": message}).to_string()
         }
+    }
+}
+
+/// The tools of an MCP `tools/list` JSON array, as `start` reads them.
+fn tools_from_json(tools_json: &str) -> Result<Vec<Tool>, JsValue> {
+    let raw: Vec<Value> = serde_json::from_str(tools_json)
+        .map_err(|e| JsError::new(&format!("invalid tools JSON: {e}")))?;
+    tools_from_mcp(&raw).map_err(|e| JsError::new(&format!("reading tools: {e:#}")).into())
+}
+
+fn set(err: &js_sys::Error, key: &str, value: JsValue) {
+    let _ = js_sys::Reflect::set(err, &JsValue::from_str(key), &value);
+}
+
+/// A `LeanError` as the JS exception lean's own `Lean` calls throw:
+/// `name` `"PrefixImage"` with `code` `"STALE"` (and `field`, what
+/// differs), `"NOT_AN_IMAGE"` or `"TRUNCATED"`; `name` `"ContextOverflow"`
+/// with `code` `"CONTEXT_OVERFLOW"`, `needed` and `available`; otherwise a
+/// plain `Error`.
+fn lean_error_to_js(e: LeanError) -> JsValue {
+    let err = js_sys::Error::new(&e.to_string());
+    match e {
+        LeanError::ContextOverflow { needed, available } => {
+            err.set_name("ContextOverflow");
+            set(&err, "code", "CONTEXT_OVERFLOW".into());
+            set(&err, "needed", (needed as f64).into());
+            set(&err, "available", (available as f64).into());
+        }
+        LeanError::PrefixImage(kind) => {
+            err.set_name("PrefixImage");
+            let code = match kind {
+                PrefixImageError::NotAnImage => "NOT_AN_IMAGE",
+                PrefixImageError::Stale(field) => {
+                    set(&err, "field", field.into());
+                    "STALE"
+                }
+                PrefixImageError::Truncated => "TRUNCATED",
+            };
+            set(&err, "code", code.into());
+        }
+        LeanError::Other(_) => {}
+    }
+    err.into()
+}
+
+fn js_message(e: &JsValue) -> String {
+    e.dyn_ref::<js_sys::Error>()
+        .map(|e| String::from(e.message()))
+        .or_else(|| e.as_string())
+        .unwrap_or_else(|| format!("{e:?}"))
+}
+
+/// `Write` over the page's `onChunk(Uint8Array)`; a throw is a write error.
+struct ChunkWriter(js_sys::Function);
+
+impl Write for ChunkWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .call1(&JsValue::NULL, &js_sys::Uint8Array::from(buf))
+            .map_err(|e| std::io::Error::other(format!("onChunk threw: {}", js_message(&e))))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `Read` over a `Uint8Array` holding the whole image, copied into wasm
+/// memory one read at a time.
+struct BytesReader {
+    data: js_sys::Uint8Array,
+    pos: u32,
+}
+
+impl Read for BytesReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = (buf.len() as u32).min(self.data.length() - self.pos);
+        self.data
+            .subarray(self.pos, self.pos + n)
+            .copy_to(&mut buf[..n as usize]);
+        self.pos += n;
+        Ok(n as usize)
+    }
+}
+
+/// `Read` over the page's `read(n)`, which returns the next at most `n`
+/// bytes as a `Uint8Array` (an empty one at the end).
+struct FnReader(js_sys::Function);
+
+impl Read for FnReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let got = self
+            .0
+            .call1(&JsValue::NULL, &JsValue::from_f64(buf.len() as f64))
+            .map_err(|e| std::io::Error::other(format!("read threw: {}", js_message(&e))))?;
+        let bytes: js_sys::Uint8Array = got
+            .dyn_into()
+            .map_err(|_| std::io::Error::other("read(n) must return a Uint8Array"))?;
+        let n = bytes.length() as usize;
+        if n > buf.len() {
+            return Err(std::io::Error::other("read(n) returned more than n bytes"));
+        }
+        bytes.copy_to(&mut buf[..n]);
+        Ok(n)
     }
 }
 
@@ -195,6 +309,84 @@ impl AgentJs {
         let outcome = agent.provide_tool_results(results).await;
         self.put(agent);
         Ok(outcome_to_json(outcome))
+    }
+
+    /// Prefills the system prompt and the tools (`tools_json` as for
+    /// `start`) without generating: the next `start` with the same tools
+    /// processes only the user's words. Resolves to the prefix's token
+    /// count.
+    pub async fn prefill(&self, tools_json: String) -> Result<f64, JsValue> {
+        let tools = tools_from_json(&tools_json)?;
+        let mut agent = self.take()?;
+        let result = agent.prefill(&tools).await;
+        self.put(agent);
+        result.map(|n| n as f64).map_err(lean_error_to_js)
+    }
+
+    /// The key to store the prefix image for `tools_json` under (32 hex
+    /// characters). It changes whenever the image would no longer fit:
+    /// another system prompt, tools list, chat template, model file,
+    /// engine build or backend.
+    #[wasm_bindgen(js_name = prefixKey)]
+    pub fn prefix_key(&self, tools_json: String) -> Result<String, JsValue> {
+        let tools = tools_from_json(&tools_json)?;
+        let agent = self.take()?;
+        let result = agent.prefix_key(&tools);
+        self.put(agent);
+        result.map_err(lean_error_to_js)
+    }
+
+    /// Writes the prefix image for `tools_json` through `onChunk(bytes)`,
+    /// called once for the 128-byte header and then once per K or V tensor
+    /// of each layer, in order; write each chunk at the running offset (an
+    /// OPFS `FileSystemSyncAccessHandle.write(bytes, {at})`). Each chunk is
+    /// a fresh `Uint8Array` the callback may keep. Prefills first if the
+    /// prefix is not resident. Resolves to the total byte count. A throw
+    /// from `onChunk` rejects the call; the agent stays usable.
+    #[wasm_bindgen(js_name = savePrefix)]
+    pub async fn save_prefix(
+        &self,
+        tools_json: String,
+        on_chunk: js_sys::Function,
+    ) -> Result<f64, JsValue> {
+        let tools = tools_from_json(&tools_json)?;
+        let mut agent = self.take()?;
+        let result = agent.save_prefix(&tools, &mut ChunkWriter(on_chunk)).await;
+        self.put(agent);
+        result.map(|n| n as f64).map_err(lean_error_to_js)
+    }
+
+    /// Restores an image written by `savePrefix` for the same tools, so the
+    /// next `start` with them processes only the user's words. `source` is
+    /// the whole image as a `Uint8Array`, or a synchronous `read(n)`
+    /// returning the next at most `n` bytes as a `Uint8Array` (in a worker,
+    /// an OPFS sync access handle). Throws an `Error` named `"PrefixImage"`
+    /// (`code` `"STALE"` with `field`, `"NOT_AN_IMAGE"` or `"TRUNCATED"`)
+    /// when the image cannot be used: the agent stays usable; call
+    /// `savePrefix` and overwrite the image.
+    #[wasm_bindgen(js_name = restorePrefix)]
+    pub fn restore_prefix(&self, tools_json: String, source: JsValue) -> Result<(), JsValue> {
+        let tools = tools_from_json(&tools_json)?;
+        let mut agent = self.take()?;
+        let result = if let Some(data) = source.dyn_ref::<js_sys::Uint8Array>() {
+            agent.restore_prefix(
+                &tools,
+                &mut BytesReader {
+                    data: data.clone(),
+                    pos: 0,
+                },
+            )
+        } else if let Some(f) = source.dyn_ref::<js_sys::Function>() {
+            agent.restore_prefix(&tools, &mut FnReader(f.clone()))
+        } else {
+            self.put(agent);
+            return Err(JsError::new(
+                "restorePrefix: source must be a Uint8Array or a read(n) function",
+            )
+            .into());
+        };
+        self.put(agent);
+        result.map_err(lean_error_to_js)
     }
 
     /// Abandon the current turn (e.g. after an `error` outcome) without
