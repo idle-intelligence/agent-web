@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds the agent-wasm package, checks the built wasm for local paths, and
-# copies the package to _site/pkg.
+# copies the package, with the OPFS model download module
+# (crates/agent-wasm/js/opfs-gguf.js), to _site/pkg.
 #
 # Requires wasm-pack and wasm-bindgen-cli (version matching Cargo.lock's
 # wasm-bindgen exactly: `cargo install wasm-bindgen-cli --version <ver>
@@ -38,5 +39,6 @@ echo "==> Assembling _site"
 rm -rf _site
 mkdir -p _site/pkg
 cp -R crates/agent-wasm/pkg/. _site/pkg/
+cp crates/agent-wasm/js/opfs-gguf.js _site/pkg/
 
 echo "==> Wrote _site/pkg"

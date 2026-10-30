@@ -57,6 +57,8 @@ The wasm package (needs [wasm-pack](https://rustwasm.github.io/wasm-pack/)) is b
 scripts/build.sh
 ```
 
+`_site/pkg/opfs-gguf.js` sits next to it, for a Web Worker: `downloadGguf(url, { sha256 })` downloads the GGUF into the origin private file system with HTTP Range requests of 64 MiB, each written at its offset, resumes a download cut short, checks the size, the GGUF magic and, when given, the SHA-256, and resolves to a `FileSystemSyncAccessHandle` on the file. `Agent.load` takes that handle in place of the file's bytes and reads the model at offsets, one tensor at a time, so the file never sits whole in JS or wasm memory; close the handle once `load` resolves. `opfsUnavailable()` says why OPFS cannot be used (Safari private browsing, no sync access handles), in which case the page passes the bytes as before. `askPersist()`, called from the page, asks the browser to keep the file under storage pressure.
+
 ## Run
 
 One utterance, with the tool calls answered from `crates/agent/fixtures/sonos/results/`:
