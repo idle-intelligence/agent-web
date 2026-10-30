@@ -30,7 +30,7 @@
 //! that prefill. Where the image is kept is the page's choice.
 
 use std::cell::RefCell;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use wasm_bindgen::prelude::*;
 
@@ -39,7 +39,10 @@ use agent::agent::{
 };
 use agent::lean_generator::LeanGenerator;
 use anyhow::Result;
-use lean::{Backend, GgufSource, LeanError, LoadOptions, PrefixImageError, TokenizerSource};
+use lean::{
+    Backend, GgufSource, LeanError, LoadOptions, OpfsReader, PrefixImageError, ReadSeek,
+    TokenizerSource,
+};
 use serde_json::Value;
 
 /// Token counts of a step, as the `timing` field of `needTools` and
@@ -140,21 +143,41 @@ impl Write for ChunkWriter {
     }
 }
 
-/// `Read` over a `Uint8Array` holding the whole image, copied into wasm
-/// memory one read at a time.
+/// `Read + Seek` over a `Uint8Array` holding a whole file (a GGUF or a
+/// prefix image), copied into wasm memory one read at a time.
 struct BytesReader {
     data: js_sys::Uint8Array,
-    pos: u32,
+    pos: u64,
 }
 
 impl Read for BytesReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = (buf.len() as u32).min(self.data.length() - self.pos);
+        let len = self.data.length() as u64;
+        let n = (buf.len() as u64).min(len.saturating_sub(self.pos)) as u32;
+        let start = self.pos as u32;
         self.data
-            .subarray(self.pos, self.pos + n)
+            .subarray(start, start + n)
             .copy_to(&mut buf[..n as usize]);
-        self.pos += n;
+        self.pos += n as u64;
         Ok(n as usize)
+    }
+}
+
+impl Seek for BytesReader {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let new_pos = match pos {
+            SeekFrom::Start(p) => p as i64,
+            SeekFrom::End(p) => self.data.length() as i64 + p,
+            SeekFrom::Current(p) => self.pos as i64 + p,
+        };
+        if new_pos < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek before byte 0",
+            ));
+        }
+        self.pos = new_pos as u64;
+        Ok(self.pos)
     }
 }
 
@@ -201,13 +224,18 @@ pub struct AgentJs {
 
 #[wasm_bindgen(js_class = Agent)]
 impl AgentJs {
-    /// `gguf_bytes` is the GGUF file, `tokenizer_json` the text of
+    /// `gguf` is the GGUF file: a `Uint8Array` holding it, or, in a Web
+    /// Worker, a `FileSystemSyncAccessHandle` on it in the origin private
+    /// file system. Either way the model is read one tensor at a time and
+    /// never copied whole into wasm memory; with the handle, it is read at
+    /// offsets and never sits whole in JS memory either (close the handle
+    /// once `load` resolves). `tokenizer_json` is the text of
     /// `tokenizer.json`, `tokenizer_config_json` the text of
     /// `tokenizer_config.json` (its `chat_template` renders every prompt).
     /// `max_ctx` is the KV cache size in tokens: each step's prompt plus
     /// `max_new_tokens` must fit.
     pub async fn load(
-        gguf_bytes: js_sys::Uint8Array,
+        gguf: JsValue,
         tokenizer_json: String,
         tokenizer_config_json: String,
         system_prompt: String,
@@ -217,8 +245,23 @@ impl AgentJs {
         console_error_panic_hook::set_once();
         let template = lean_chat::template_from_tokenizer_config(&tokenizer_config_json)
             .map_err(|e| JsError::new(&format!("{e:#}")))?;
+        let gguf: Box<dyn ReadSeek> = if let Some(data) = gguf.dyn_ref::<js_sys::Uint8Array>() {
+            Box::new(BytesReader {
+                data: data.clone(),
+                pos: 0,
+            })
+        } else if let Ok(handle) = gguf.dyn_into::<web_sys::FileSystemSyncAccessHandle>() {
+            Box::new(
+                OpfsReader::new(handle)
+                    .map_err(|e| JsError::new(&format!("reading the GGUF handle: {e}")))?,
+            )
+        } else {
+            return Err(JsError::new(
+                "gguf must be a Uint8Array or a FileSystemSyncAccessHandle",
+            ));
+        };
         let generator = LeanGenerator::load(LoadOptions {
-            gguf: GgufSource::Bytes(gguf_bytes.to_vec()),
+            gguf: GgufSource::Reader(gguf),
             tokenizer: TokenizerSource::Json(tokenizer_json),
             max_ctx,
             backend: Backend::Auto,
