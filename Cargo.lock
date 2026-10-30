@@ -840,7 +840,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 [[package]]
 name = "lean"
 version = "0.1.0"
-source = "git+https://github.com/idle-intelligence/llm-web?rev=4ce38c4e1bb0cdd4d709034742a9d1d28cf4081b#4ce38c4e1bb0cdd4d709034742a9d1d28cf4081b"
+source = "git+https://github.com/idle-intelligence/llm-web?rev=ee92a41ff6cb78ef36f37cb468b1088fbdbbb8b5#ee92a41ff6cb78ef36f37cb468b1088fbdbbb8b5"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -861,7 +861,7 @@ dependencies = [
 [[package]]
 name = "lean-chat"
 version = "0.1.0"
-source = "git+https://github.com/idle-intelligence/llm-web?rev=4ce38c4e1bb0cdd4d709034742a9d1d28cf4081b#4ce38c4e1bb0cdd4d709034742a9d1d28cf4081b"
+source = "git+https://github.com/idle-intelligence/llm-web?rev=ee92a41ff6cb78ef36f37cb468b1088fbdbbb8b5#ee92a41ff6cb78ef36f37cb468b1088fbdbbb8b5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -876,7 +876,7 @@ dependencies = [
 [[package]]
 name = "lean-core"
 version = "0.1.0"
-source = "git+https://github.com/idle-intelligence/llm-web?rev=4ce38c4e1bb0cdd4d709034742a9d1d28cf4081b#4ce38c4e1bb0cdd4d709034742a9d1d28cf4081b"
+source = "git+https://github.com/idle-intelligence/llm-web?rev=ee92a41ff6cb78ef36f37cb468b1088fbdbbb8b5#ee92a41ff6cb78ef36f37cb468b1088fbdbbb8b5"
 dependencies = [
  "anyhow",
  "bytemuck",
