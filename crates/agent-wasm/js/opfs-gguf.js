@@ -44,7 +44,9 @@ export async function opfsUnavailable() {
 
 // Asks the browser to keep this origin's storage under storage pressure.
 // StorageManager.persist() exists only on a window, so the page calls this;
-// in a worker it reports whether storage is already persistent.
+// in a worker it reports whether storage is already persistent. Firefox
+// answers through a permission prompt, so the promise can stay pending until
+// the visitor clicks: never wait for it before loading.
 export async function askPersist() {
   try {
     if (typeof navigator.storage.persist === 'function') return await navigator.storage.persist();
